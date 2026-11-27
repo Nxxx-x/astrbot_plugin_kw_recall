@@ -1,14 +1,15 @@
 """消息撤回 · 面向 QQ 官方机器人适配器（qq_official / qq_official_webhook）。
 
-支持四类命中：关键词、5 位及以上连续数字、链接、二维码图片，每类可单独开关并
-配置各自的撤回提示。群消息命中后调用官方 DELETE 接口撤回。
+支持五类命中：关键词、5 位及以上连续数字、链接、二维码图片、Emoji，每类可单独
+开关并配置各自的撤回提示。群消息命中后调用官方 DELETE 接口撤回。
+
+所有配置项定义在 _conf_schema.json，在 AstrBot 管理面板 → 插件 → 本插件 → 配置
+里修改，保存后即时生效（插件读取的是同一份 config 对象）。
 
 官机撤回的三个前提，写死在 README 里，代码这边只做兜底：
 1. 只能撤回 2 分钟内发送的消息，超时返回 40064004；
 2. 机器人必须是群管理员才能撤回群成员的消息，否则 40062003；
 3. 群主需在群设置里放开「接收全量消息」，否则机器人只看得到 @ 它的消息。
-
-配置统一存在 KV（data 目录）里，Web 界面和群指令改的是同一份数据。
 """
 
 from __future__ import annotations
@@ -19,18 +20,14 @@ import re
 from typing import Any
 
 import astrbot.api.message_components as Comp
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.api.web import error_response, json_response, request
 
 try:  # 官机适配器依赖 botpy，理论上必装；缺失时插件仍可加载
     from botpy.http import Route
 except Exception:  # pragma: no cover
     Route = None  # type: ignore[assignment]
-
-PLUGIN_NAME = "astrbot_plugin_kw_recall"
-STATE_KEY = "state"
 
 QQ_OFFICIAL_TYPES = (
     filter.PlatformAdapterType.QQOFFICIAL
@@ -79,6 +76,14 @@ DEFAULT_REPLIES = {
     "qrcode": "请勿发送二维码，已撤回",
     "emoji": "请勿刷屏表情，已撤回",
 }
+# 只有关键词默认开启，其余四类默认关闭，避免装完就误伤
+DEFAULT_ENABLED = {
+    "keyword": True,
+    "number": False,
+    "link": False,
+    "qrcode": False,
+    "emoji": False,
+}
 
 # QQ 官机的原生表情（含超级表情、收藏的表情包）不以 Unicode 字符下发，
 # 适配器会把 <faceType=4,...> 转成 [表情:描述] 或 [表情]。这类属于 QQ 自带
@@ -94,6 +99,7 @@ AT_TAG_RE = re.compile(r"<qqbot-at-user\b[^>]*>|<@!?[^>]*>", re.IGNORECASE)
 def _strip_markup(text: str) -> str:
     """剥掉官机的 @ 与表情标签，只留用户真正打的文字。"""
     return AT_TAG_RE.sub("", FACE_TAG_RE.sub("", text))
+
 
 # 标准库 re 没有 Unicode 属性，只能按区段兜底；装了 regex 就用字素簇 +
 # Extended_Pictographic，能正确把 👨‍👩‍👧、👍🏽、🇨🇳 各算成一个。
@@ -125,6 +131,10 @@ FALLBACK_EMOJI_RE = re.compile(
 # 1️⃣ #️⃣ 这类键帽表情在降级模式下要整段匹配，否则会漏掉或把数字当正文
 KEYCAP_RE = re.compile(r"[0-9#*]\ufe0f?\u20e3")
 
+# 单条消息最多解析几张图，避免一条九宫格把事件循环拖住
+MAX_IMAGES_PER_MESSAGE = 4
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
 
 def _count_emoji(text: str) -> int:
     """统计 Unicode emoji 字符个数，如 😀 ❤️ 👍。
@@ -143,151 +153,116 @@ def _count_emoji(text: str) -> int:
     keycaps = len(KEYCAP_RE.findall(rest))
     return len(FALLBACK_EMOJI_RE.findall(KEYCAP_RE.sub("", rest))) + keycaps
 
-# 单条消息最多解析几张图，避免一条九宫格把事件循环拖住
-MAX_IMAGES_PER_MESSAGE = 4
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+def _parse_keywords(raw: Any) -> list[str]:
+    """把配置里的多行文本解析成词表：去空行、去重、限长限量。"""
+    if isinstance(raw, (list, tuple)):
+        lines = [str(item) for item in raw]
+    else:
+        lines = str(raw or "").splitlines()
+
+    words: list[str] = []
+    for line in lines:
+        word = line.strip()[:MAX_KEYWORD_LEN]
+        if word and word not in words:
+            words.append(word)
+        if len(words) >= MAX_KEYWORDS:
+            break
+    return words
 
 
-def _default_types() -> dict[str, dict[str, Any]]:
-    return {
-        key: {"enabled": key == "keyword", "reply": DEFAULT_REPLIES[key]}
-        for key in TYPE_KEYS
-    }
-
-
-def _default_state() -> dict[str, Any]:
-    return {
-        "enabled": True,
-        "notify": False,
-        "notify_at": False,
-        "keywords": [],
-        "types": _default_types(),
-        "count": 0,
-        "last_error": "",
-    }
-
-
-def _clean_reply(value: Any) -> str:
-    return str(value or "").strip()[:MAX_REPLY_LEN]
-
-
-class KeywordRecall(Star):
-    """群消息命中关键词/号码/链接/二维码就撤回。"""
-
-    def __init__(self, context: Context):
+class MessageRecall(Star):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
-        self._lock = asyncio.Lock()
-        self._cache: dict[str, Any] | None = None
-        self._qr_lock = asyncio.Lock()
+        # AstrBotConfig 继承自 dict；缺失时退化为空字典，靠代码里的默认值兜底
+        self.config = config if isinstance(config, dict) else {}
+        self._count = 0
+        self._last_error = ""
         self._qr_detector = None
         self._qr_missing_warned = False
-
-        # 插件可视化视图的后端接口，视图端通过 bridge.apiGet / apiPost 调用
-        context.register_web_api(
-            f"/{PLUGIN_NAME}/state", self.api_get_state, ["GET"], "读取撤回配置"
-        )
-        context.register_web_api(
-            f"/{PLUGIN_NAME}/state/save",
-            self.api_save_state,
-            ["POST"],
-            "保存撤回配置",
-        )
+        self._qr_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
-    # 状态读写
+    # 配置读取
     # ------------------------------------------------------------------
 
-    async def _load(self) -> dict[str, Any]:
-        return self._normalize(await self.get_kv_data(STATE_KEY, None))
+    def _group(self, key: str) -> dict[str, Any]:
+        raw = self.config.get(key)
+        return raw if isinstance(raw, dict) else {}
 
-    @staticmethod
-    def _normalize(raw: Any) -> dict[str, Any]:
-        state = _default_state()
-        if not isinstance(raw, dict):
-            return state
+    def _enabled(self) -> bool:
+        return bool(self.config.get("enabled", True))
 
-        for flag in ("enabled", "notify", "notify_at"):
-            if flag in raw:
-                state[flag] = bool(raw[flag])
+    def _notify(self) -> bool:
+        return bool(self.config.get("notify", False))
 
-        types_raw = raw.get("types")
-        if isinstance(types_raw, dict):
-            for key in TYPE_KEYS:
-                item = types_raw.get(key)
-                if not isinstance(item, dict):
-                    continue
-                if "enabled" in item:
-                    state["types"][key]["enabled"] = bool(item["enabled"])
-                if "reply" in item:
-                    state["types"][key]["reply"] = _clean_reply(item["reply"])
-        else:
-            # 旧版本只有 recall_numbers / notify_text，升级时平滑迁移
-            for key, flat in (
-                ("number", "recall_numbers"),
-                ("link", "recall_links"),
-                ("qrcode", "recall_qrcodes"),
-            ):
-                if flat in raw:
-                    state["types"][key]["enabled"] = bool(raw[flat])
-            if raw.get("notify_text"):
-                state["types"]["keyword"]["reply"] = _clean_reply(raw["notify_text"])
+    def _notify_at(self) -> bool:
+        return bool(self.config.get("notify_at", False))
 
-        keywords = raw.get("keywords")
-        if not isinstance(keywords, list):
-            keywords = []
-        state["keywords"] = [
-            str(k).strip()[:MAX_KEYWORD_LEN] for k in keywords if str(k).strip()
-        ][:MAX_KEYWORDS]
+    def _on(self, key: str) -> bool:
+        raw = self._group(key).get("enabled", DEFAULT_ENABLED[key])
+        return bool(raw)
 
+    def _reply(self, key: str) -> str:
+        raw = self._group(key).get("reply", DEFAULT_REPLIES[key])
+        if raw is None:
+            raw = DEFAULT_REPLIES[key]
+        return str(raw).strip()[:MAX_REPLY_LEN]
+
+    def _keywords(self) -> list[str]:
+        return _parse_keywords(self._group("keyword").get("list", ""))
+
+    def _active_types(self) -> list[str]:
+        return [key for key in TYPE_KEYS if self._on(key)]
+
+    async def _persist(self) -> bool:
+        """把改动写回 data/config/<plugin>_config.json。"""
         try:
-            state["count"] = int(raw.get("count") or 0)
-        except (TypeError, ValueError):
-            state["count"] = 0
+            saver = getattr(self.config, "save_config_async", None)
+            if callable(saver):
+                await saver()
+            else:
+                self.config.save_config()  # type: ignore[attr-defined]
+            return True
+        except Exception as exc:
+            logger.warning(f"[kw_recall] 配置保存失败：{exc}")
+            return False
 
-        state["last_error"] = str(raw.get("last_error") or "")[:200]
-        return state
-
-    async def _save(self, state: dict[str, Any]) -> None:
-        await self.put_kv_data(STATE_KEY, state)
-
-    async def _state(self) -> dict[str, Any]:
-        """高频路径走内存缓存，避免每条群消息都读一次 KV。"""
-        if self._cache is None:
-            self._cache = await self._load()
-        return self._cache
+    def _set_group(self, key: str, field: str, value: Any) -> None:
+        group = self.config.get(key)
+        if not isinstance(group, dict):
+            group = {}
+            self.config[key] = group
+        group[field] = value
 
     # ------------------------------------------------------------------
     # 匹配
     # ------------------------------------------------------------------
 
-    def _match_text(
-        self, text: str, state: dict[str, Any]
-    ) -> tuple[str, str] | None:
+    def _match_text(self, text: str) -> tuple[str, str] | None:
         """按 关键词 → 链接 → 号码 → emoji 的顺序匹配，返回 (类型, 命中说明)。"""
-        types = state["types"]
-
         # QQ 原生表情是 [表情:描述] 标签、@ 是 <qqbot-at-user id="…"/> 标签，
         # 两者都不是用户打的字：标签里的描述文字和 openid 不能当正文参与匹配，
         # 否则「[表情:笑哭]」会被「笑」误命中、@ 别人的 openid 会被当成号码。
         text = _strip_markup(text)
 
-        if types["keyword"]["enabled"]:
+        if self._on("keyword"):
             lowered = text.lower()
-            for kw in state["keywords"]:
+            for kw in self._keywords():
                 if kw.lower() in lowered:
                     return "keyword", f"关键词「{kw}」"
 
-        if types["link"]["enabled"]:
+        if self._on("link"):
             found = LINK_RE.search(text)
             if found:
                 return "link", f"链接 {found.group(0)[:40]}"
 
-        if types["number"]["enabled"]:
+        if self._on("number"):
             found = NUMBER_RE.search(text)
             if found:
                 return "number", f"号码 {found.group(0)}"
 
-        if types["emoji"]["enabled"]:
+        if self._on("emoji"):
             count = _count_emoji(text)
             if count:
                 return "emoji", f"{count} 个 emoji"
@@ -404,7 +379,7 @@ class KeywordRecall(Star):
         if image is None:
             return ""
 
-        for candidate in KeywordRecall._qr_candidates(image, cv2):
+        for candidate in MessageRecall._qr_candidates(image, cv2):
             try:
                 ok, texts, _points, _ = detector.detectAndDecodeMulti(candidate)
             except Exception:
@@ -457,21 +432,19 @@ class KeywordRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
-        state = await self._state()
-        if not state["enabled"]:
+        if not self._enabled():
             return
 
-        types = state["types"]
-        active = [key for key in TYPE_KEYS if types[key]["enabled"]]
+        active = self._active_types()
         if not active:
             return
-        if active == ["keyword"] and not state["keywords"]:
+        if active == ["keyword"] and not self._keywords():
             # 只剩关键词但词表是空的，没什么可匹配
             return
 
         text = event.message_str or ""
-        hit = self._match_text(text, state) if text.strip() else None
-        if hit is None and types["qrcode"]["enabled"]:
+        hit = self._match_text(text) if text.strip() else None
+        if hit is None and self._on("qrcode"):
             hit = await self._match_qrcode(event)
         if hit is None:
             return
@@ -489,25 +462,16 @@ class KeywordRecall(Star):
             await self._recall_group_message(event, message_id)
         except Exception as exc:  # 撤回失败不影响后续消息处理
             logger.warning(f"[kw_recall] 撤回失败（{reason}）：{exc}")
-            async with self._lock:
-                current = await self._load()
-                current["last_error"] = str(exc)[:200]
-                await self._save(current)
-                self._cache = current
+            self._last_error = str(exc)[:200]
             return
 
         logger.info(f"[kw_recall] 已撤回消息，原因：{reason}")
+        self._count += 1
+        self._last_error = ""
 
-        async with self._lock:
-            current = await self._load()
-            current["count"] = int(current.get("count") or 0) + 1
-            current["last_error"] = ""
-            await self._save(current)
-            self._cache = current
-
-        reply_text = state["types"][hit_type]["reply"]
-        if state.get("notify") and reply_text:
-            if state.get("notify_at"):
+        reply_text = self._reply(hit_type)
+        if self._notify() and reply_text:
+            if self._notify_at():
                 # 官机会把 At 转成 <qqbot-at-user id="openid" /> 内联进文本，
                 # openid 正好就是发送者 ID。
                 yield event.chain_result(
@@ -517,7 +481,7 @@ class KeywordRecall(Star):
                 yield event.plain_result(reply_text)
 
     # ------------------------------------------------------------------
-    # 群指令（手机上临时改配置用）
+    # 群指令（手机上临时改配置用，改动会写回插件配置文件）
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -525,106 +489,117 @@ class KeywordRecall(Star):
         parts = (event.message_str or "").strip().split(maxsplit=index)
         return parts[index].strip() if len(parts) > index else ""
 
-    def _status_lines(self, state: dict[str, Any]) -> list[str]:
-        types = state["types"]
-        kws = state["keywords"]
+    def _status_lines(self) -> list[str]:
+        kws = self._keywords()
         lines = [
-            f"总开关：{'开启' if state['enabled'] else '关闭'}",
-            f"关键词：{'开启' if types['keyword']['enabled'] else '关闭'}"
-            f"（{len(kws)} 个）",
-            f"号码：{'开启' if types['number']['enabled'] else '关闭'}"
-            "（5 位及以上连续数字）",
-            f"链接：{'开启' if types['link']['enabled'] else '关闭'}",
-            f"二维码：{'开启' if types['qrcode']['enabled'] else '关闭'}",
-            f"Emoji：{'开启（有就撤）' if types['emoji']['enabled'] else '关闭'}",
-            f"撤回后提示：{'开启' if state['notify'] else '关闭'}"
-            f"{'（@ 被撤回的人）' if state['notify_at'] else ''}",
-            f"累计撤回 {state['count']} 条",
+            f"总开关：{'开启' if self._enabled() else '关闭'}",
+            f"关键词：{'开启' if self._on('keyword') else '关闭'}（{len(kws)} 个）",
+            f"号码：{'开启' if self._on('number') else '关闭'}（5 位及以上连续数字）",
+            f"链接：{'开启' if self._on('link') else '关闭'}",
+            f"二维码：{'开启' if self._on('qrcode') else '关闭'}",
+            f"Emoji：{'开启（有就撤）' if self._on('emoji') else '关闭'}",
+            f"撤回后提示：{'开启' if self._notify() else '关闭'}"
+            f"{'（@ 被撤回的人）' if self._notify_at() else ''}",
+            f"本次运行累计撤回 {self._count} 条",
         ]
+        if self._last_error:
+            lines.append(f"最近一次失败：{self._last_error}")
         return lines
 
     @filter.command("撤回词", alias={"kw"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def manage(self, event: AstrMessageEvent):
         """管理关键词：/撤回词 查看 | /撤回词 +词 | /撤回词 -词"""
-        state = await self._state()
         arg = self._arg(event)
 
         if not arg:
-            kws = state["keywords"]
+            kws = self._keywords()
             body = "、".join(kws) if kws else "（空）"
-            reply = "\n".join(
-                self._status_lines(state)
-                + [f"词表：{body}", "用法：/撤回词 +新词、/撤回词 -旧词"]
+            yield event.plain_result(
+                "\n".join(
+                    self._status_lines()
+                    + [
+                        f"词表：{body}",
+                        "用法：/撤回词 +新词、/撤回词 -旧词",
+                    ]
+                )
             )
-            yield event.plain_result(reply)
             return
 
-        reply = ""
-        async with self._lock:
-            current = await self._load()
-            kws = current["keywords"]
+        action = arg[0]
+        word = arg[1:].strip()[:MAX_KEYWORD_LEN]
+        if action not in ("+", "-") or not word:
+            yield event.plain_result(
+                "用法：/撤回词 +新词 或 /撤回词 -旧词"
+            )
+            return
 
-            if arg.startswith("+"):
-                kw = arg[1:].strip()[:MAX_KEYWORD_LEN]
-                if not kw:
-                    reply = "关键词不能为空"
-                elif kw in kws:
-                    reply = f"「{kw}」已经在了"
-                elif len(kws) >= MAX_KEYWORDS:
-                    reply = f"最多只能有 {MAX_KEYWORDS} 个关键词"
-                else:
-                    kws.append(kw)
-                    await self._save(current)
-                    self._cache = current
-                    reply = f"已添加「{kw}」，当前 {len(kws)} 个"
-            elif arg.startswith("-"):
-                kw = arg[1:].strip()
-                if kw not in kws:
-                    reply = f"没有「{kw}」"
-                else:
-                    kws.remove(kw)
-                    await self._save(current)
-                    self._cache = current
-                    reply = f"已删除「{kw}」，当前 {len(kws)} 个"
-            else:
-                reply = "用法：/撤回词 +新词 或 /撤回词 -旧词"
+        words = self._keywords()
+        if action == "+":
+            if word in words:
+                yield event.plain_result(f"「{word}」已经在词表里了")
+                return
+            if len(words) >= MAX_KEYWORDS:
+                yield event.plain_result(f"词表已满（{MAX_KEYWORDS} 个），先删几个")
+                return
+            words.append(word)
+            message = f"已添加「{word}」，当前 {len(words)} 个"
+        else:
+            if word not in words:
+                yield event.plain_result(f"词表里没有「{word}」")
+                return
+            words.remove(word)
+            message = f"已删除「{word}」，当前 {len(words)} 个"
 
-        yield event.plain_result(reply)
+        self._set_group("keyword", "list", "\n".join(words))
+        await self._persist()
+        yield event.plain_result(message)
 
     async def _toggle(self, event: AstrMessageEvent, key: str, tip: str):
         arg = self._arg(event).lower()
         label = TYPE_LABELS[key]
+        current = self._on(key)
 
-        reply = ""
-        async with self._lock:
-            state = await self._load()
-            if arg in ("开", "开启", "on", "1", "true"):
-                state["types"][key]["enabled"] = True
-                await self._save(state)
-                self._cache = state
-                reply = f"{label}撤回已开启{tip}"
-            elif arg in ("关", "关闭", "off", "0", "false"):
-                state["types"][key]["enabled"] = False
-                await self._save(state)
-                self._cache = state
-                reply = f"{label}撤回已关闭"
-            elif arg:
-                reply = f"用法：/{TYPE_COMMANDS[key]} 开 或 关"
-            else:
-                current = "开启" if state["types"][key]["enabled"] else "关闭"
-                reply = (
-                    f"{label}撤回当前{current}。用法：/{TYPE_COMMANDS[key]} 开|关"
-                )
+        if arg in ("开", "开启", "on", "1", "true", "启用"):
+            target = True
+        elif arg in ("关", "关闭", "off", "0", "false", "停用"):
+            target = False
+        elif not arg:
+            yield event.plain_result(
+                f"{label}撤回当前{'开启' if current else '关闭'}。"
+                f"用法：/{TYPE_COMMANDS[key]} 开|关"
+            )
+            return
+        else:
+            yield event.plain_result(f"用法：/{TYPE_COMMANDS[key]} 开|关")
+            return
 
-        yield event.plain_result(reply)
+        if target == current:
+            yield event.plain_result(
+                f"{label}撤回{'已经是开启' if target else '已经是关闭'}状态"
+            )
+            return
 
-    @filter.command("撤回号码", alias={"kwnum"})
+        self._set_group(key, "enabled", target)
+        ok = await self._persist()
+        suffix = "" if ok else "（配置写回失败，重启后可能丢失）"
+        yield event.plain_result(
+            f"{label}撤回已{'开启' if target else '关闭'}{tip}{suffix}"
+        )
+
+    @filter.command("撤回关键词", alias={"kwnkw"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def toggle_keywords(self, event: AstrMessageEvent):
+        """开关关键词撤回：/撤回关键词 开 | /撤回关键词 关"""
+        async for result in self._toggle(event, "keyword", "：消息包含词表内容会被撤回"):
+            yield result
+
+    @filter.command("撤回号码", alias={"kwnnum"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def toggle_numbers(self, event: AstrMessageEvent):
         """开关号码撤回：/撤回号码 开 | /撤回号码 关"""
         async for result in self._toggle(
-            event, "number", "：消息含 5 位及以上连续数字会被撤回"
+            event, "number", "：5 位及以上连续数字会被撤回"
         ):
             yield result
 
@@ -632,28 +607,23 @@ class KeywordRecall(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def toggle_links(self, event: AstrMessageEvent):
         """开关链接撤回：/撤回链接 开 | /撤回链接 关"""
-        async for result in self._toggle(event, "link", "：消息含网址会被撤回"):
+        async for result in self._toggle(event, "link", "：消息含链接会被撤回"):
             yield result
 
     @filter.command("撤回二维码", alias={"kwnqr"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def toggle_qrcodes(self, event: AstrMessageEvent):
         """开关二维码撤回：/撤回二维码 开 | /撤回二维码 关"""
-        async for result in self._toggle(event, "qrcode", "：消息含二维码图片会被撤回"):
+        async for result in self._toggle(
+            event, "qrcode", "：消息含二维码图片会被撤回"
+        ):
             yield result
 
     @filter.command("撤回表情", alias={"kwnemoji"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def toggle_emoji(self, event: AstrMessageEvent):
         """开关表情撤回：/撤回表情 开 | /撤回表情 关"""
-        async for result in self._toggle(event, "emoji", "：消息含 emoji 字符就会被撤回"):
-            yield result
-
-    @filter.command("撤回关键词", alias={"kwnkw"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_keywords(self, event: AstrMessageEvent):
-        """开关关键词撤回：/撤回关键词 开 | /撤回关键词 关"""
-        async for result in self._toggle(event, "keyword", ""):
+        async for result in self._toggle(event, "emoji", "：消息含 emoji 字符会被撤回"):
             yield result
 
     @filter.command("撤回回复", alias={"kwnreply"})
@@ -662,14 +632,13 @@ class KeywordRecall(Star):
         """设置各类撤回提示：/撤回回复 链接 文案（文案填 - 表示清空）"""
         arg = self._arg(event)
         if not arg:
-            state = await self._state()
             lines = [
-                f"{TYPE_LABELS[key]}：{state['types'][key]['reply'] or '（不发提示）'}"
+                f"{TYPE_LABELS[key]}：{self._reply(key) or '（不发提示）'}"
                 for key in TYPE_KEYS
             ]
             yield event.plain_result(
                 "\n".join(
-                    [f"撤回后提示：{'开启' if state['notify'] else '关闭'}"]
+                    [f"撤回后提示：{'开启' if self._notify() else '关闭'}"]
                     + lines
                     + ["用法：/撤回回复 链接 请勿发链接"]
                 )
@@ -690,7 +659,8 @@ class KeywordRecall(Star):
         )
         if key is None:
             yield event.plain_result(
-                "类型只能是：关键词、号码、链接、二维码、Emoji。例：/撤回回复 链接 请勿发链接"
+                "类型只能是：关键词、号码、链接、二维码、Emoji。"
+                "例：/撤回回复 链接 请勿发链接"
             )
             return
         if not content:
@@ -699,93 +669,12 @@ class KeywordRecall(Star):
             )
             return
 
-        text = "" if content == "-" else _clean_reply(content)
-        async with self._lock:
-            state = await self._load()
-            state["types"][key]["reply"] = text
-            await self._save(state)
-            self._cache = state
+        text = "" if content == "-" else content.strip()[:MAX_REPLY_LEN]
+        self._set_group(key, "reply", text)
+        ok = await self._persist()
+        suffix = "" if ok else "（配置写回失败，重启后可能丢失）"
 
         if text:
-            yield event.plain_result(f"{TYPE_LABELS[key]}撤回提示已改为：{text}")
+            yield event.plain_result(f"{TYPE_LABELS[key]}撤回提示已改为：{text}{suffix}")
         else:
-            yield event.plain_result(f"{TYPE_LABELS[key]}撤回后不再发送提示")
-
-    # ------------------------------------------------------------------
-    # Web API
-    # ------------------------------------------------------------------
-
-    async def api_get_state(self):
-        return json_response(await self._state())
-
-    async def api_save_state(self):
-        payload = await request.json(default={})
-        if not isinstance(payload, dict):
-            return error_response("请求体必须是 JSON 对象", status_code=400)
-
-        for flag in ("enabled", "notify", "notify_at", "recall_numbers"):
-            if flag in payload and not isinstance(payload[flag], bool):
-                return error_response(f"{flag} 必须是布尔值", status_code=400)
-
-        if "keywords" in payload and not isinstance(payload["keywords"], list):
-            return error_response("keywords 必须是数组", status_code=400)
-
-        types_payload = payload.get("types")
-        if types_payload is not None and not isinstance(types_payload, dict):
-            return error_response("types 必须是对象", status_code=400)
-        if isinstance(types_payload, dict):
-            for key, item in types_payload.items():
-                if key not in TYPE_KEYS:
-                    return error_response(f"未知的撤回类型：{key}", status_code=400)
-                if not isinstance(item, dict):
-                    return error_response(f"types.{key} 必须是对象", status_code=400)
-                if "enabled" in item and not isinstance(item["enabled"], bool):
-                    return error_response(
-                        f"types.{key}.enabled 必须是布尔值", status_code=400
-                    )
-                if "reply" in item and not isinstance(item["reply"], str):
-                    return error_response(
-                        f"types.{key}.reply 必须是字符串", status_code=400
-                    )
-
-        async with self._lock:
-            state = await self._load()
-
-            if "enabled" in payload:
-                state["enabled"] = payload["enabled"]
-            if "notify" in payload:
-                state["notify"] = payload["notify"]
-            if "notify_at" in payload:
-                state["notify_at"] = payload["notify_at"]
-
-            if isinstance(types_payload, dict):
-                for key, item in types_payload.items():
-                    if "enabled" in item:
-                        state["types"][key]["enabled"] = item["enabled"]
-                    if "reply" in item:
-                        state["types"][key]["reply"] = _clean_reply(item["reply"])
-            elif "recall_numbers" in payload:
-                state["types"]["number"]["enabled"] = payload["recall_numbers"]
-            if "notify_text" in payload:
-                state["types"]["keyword"]["reply"] = _clean_reply(payload["notify_text"])
-
-            if "keywords" in payload:
-                cleaned: list[str] = []
-                seen: set[str] = set()
-                for item in payload["keywords"]:
-                    kw = str(item).strip()[:MAX_KEYWORD_LEN]
-                    if not kw or kw in seen:
-                        continue
-                    seen.add(kw)
-                    cleaned.append(kw)
-                    if len(cleaned) >= MAX_KEYWORDS:
-                        break
-                state["keywords"] = cleaned
-
-            await self._save(state)
-            self._cache = state
-
-        return json_response(state)
-
-    async def terminate(self):
-        logger.info("[kw_recall] 插件已卸载")
+            yield event.plain_result(f"{TYPE_LABELS[key]}撤回后不再发送提示{suffix}")

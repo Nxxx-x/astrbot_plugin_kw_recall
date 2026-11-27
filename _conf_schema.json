@@ -1,0 +1,116 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后任何规则都不生效，消息一律不撤"
+  },
+  "notify": {
+    "description": "撤回后发送提示",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭则只撤回、不发言；五类各自的提示文案见下方分组"
+  },
+  "notify_at": {
+    "description": "提示时 @ 被撤回的人",
+    "type": "bool",
+    "default": false,
+    "hint": "需要先开启「撤回后发送提示」。官机会把它渲染成蓝字 @ 昵称"
+  },
+  "keyword": {
+    "description": "关键词撤回",
+    "type": "object",
+    "hint": "消息包含任一关键词就撤回，不区分英文大小写",
+    "items": {
+      "enabled": {
+        "description": "启用关键词撤回",
+        "type": "bool",
+        "default": true
+      },
+      "list": {
+        "description": "关键词列表",
+        "type": "text",
+        "default": "",
+        "hint": "一行一个，最多 200 个，每个最长 50 字。建议每个词 2 字以上，太短容易误撤。也可以群里用 /撤回词 +词 增删"
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "消息含有关键词，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "number": {
+    "description": "号码撤回",
+    "type": "object",
+    "hint": "连续 5 位及以上数字视为号码，如 12345、88888；123 45 中间断开不算",
+    "items": {
+      "enabled": {
+        "description": "启用号码撤回",
+        "type": "bool",
+        "default": false
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "请勿发送号码，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "link": {
+    "description": "链接撤回",
+    "type": "object",
+    "hint": "认协议头、www 开头、常见域名后缀和裸 IP；main.py、3.14 这类不算",
+    "items": {
+      "enabled": {
+        "description": "启用链接撤回",
+        "type": "bool",
+        "default": false
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "请勿发送链接，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "qrcode": {
+    "description": "二维码撤回",
+    "type": "object",
+    "hint": "下载消息里的图片并用 OpenCV 解码，能读出二维码内容就撤回。需要安装 requirements.txt 里的 opencv-python-headless",
+    "items": {
+      "enabled": {
+        "description": "启用二维码撤回",
+        "type": "bool",
+        "default": false
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "请勿发送二维码，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "emoji": {
+    "description": "Emoji 撤回",
+    "type": "object",
+    "hint": "只认 😀 ❤️ 👍 这类 Unicode 字符，出现一个就撤；QQ 自带表情（小黄脸、表情包）和 @ 不参与判断",
+    "items": {
+      "enabled": {
+        "description": "启用 Emoji 撤回",
+        "type": "bool",
+        "default": false
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "请勿刷屏表情，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  }
+}
