@@ -61,7 +61,7 @@ DEFAULT_REPLIES = {
     "number": "请勿发送号码，已撤回",
     "link": "请勿发送链接，已撤回",
     "qrcode": "请勿发送二维码，已撤回",
-    "emoji": "请勿刷屏表情，已撤回",
+    "emoji": "请勿发送emoji，已撤回",
 }
 # 五类规则默认全部开启，装完即生效；不想要哪一类就去配置里单独关掉
 DEFAULT_ENABLED = {
@@ -176,10 +176,10 @@ class MessageRecall(Star):
         return raw if isinstance(raw, dict) else {}
 
     def _notify(self) -> bool:
-        return bool(self.config.get("notify", False))
+        return bool(self.config.get("notify", True))
 
     def _notify_at(self) -> bool:
-        return bool(self.config.get("notify_at", False))
+        return bool(self.config.get("notify_at", True))
 
     def _on(self, key: str) -> bool:
         raw = self._group(key).get("enabled", DEFAULT_ENABLED[key])

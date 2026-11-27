@@ -2,14 +2,14 @@
   "notify": {
     "description": "撤回后发送提示",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "关闭则只撤回、不发言；五类各自的提示文案见下方分组"
   },
   "notify_at": {
     "description": "提示时 @ 被撤回的人",
     "type": "bool",
-    "default": false,
-    "hint": "需要先开启「撤回后发送提示」。官机会把它渲染成蓝字 @ 昵称"
+    "default": true,
+    "hint": "需要先开启「撤回后发送提示」。官机会把它渲染成蓝字 @ 昵称；不想 @ 人就关掉"
   },
   "keyword": {
     "description": "关键词撤回",
@@ -102,7 +102,7 @@
       "reply": {
         "description": "提示文案",
         "type": "string",
-        "default": "请勿刷屏表情，已撤回",
+        "default": "请勿发送emoji，已撤回",
         "hint": "留空表示这一类撤回后不发言"
       }
     }

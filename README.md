@@ -30,8 +30,8 @@ git clone https://github.com/Nxxx-x/astrbot_plugin_kw_recall.git
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| 撤回后发送提示 `notify` | 关 | 关掉则只撤回不发言 |
-| 提示时 @ 被撤回的人 `notify_at` | 关 | 需要先开上一项 |
+| 撤回后发送提示 `notify` | 开 | 关掉则只撤回不发言 |
+| 提示时 @ 被撤回的人 `notify_at` | 开 | 不需要 @ 就关掉 |
 | 关键词 `keyword.enabled` | 开 | 子串包含，不区分英文大小写 |
 | 关键词列表 `keyword.list` | 空 | 多行文本，一行一个 |
 | 号码 `number.enabled` | 开 | 5 位及以上连续数字 |
