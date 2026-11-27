@@ -4,7 +4,7 @@ short_desc: 关键词、号码、链接、二维码、Emoji 命中自动撤回�
 desc: 面向 QQ 官方机器人适配器的消息撤回插件。群消息命中关键词、5 位及以上连续数字、链接、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类可独立开关并各配一条提示文案，支持 WebUI 视图与群指令管理。
 version: v1.4.1
 author: 小雨季
-repo: https://github.com/Nxxx-x/astrbot-
+repo: https://github.com/Nxxx-x/astrbot_plugin_kw_recall
 support_platforms:
   - qq_official
   - qq_official_webhook
