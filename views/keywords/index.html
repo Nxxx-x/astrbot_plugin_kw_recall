@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>消息撤回</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --card: #ffffff;
+      --text: #1a1a1a;
+      --muted: #8a8a8a;
+      --line: #e8e8e8;
+      --accent: #3b82f6;
+      --danger: #ef4444;
+    }
+    [data-theme="dark"] {
+      --bg: #0f0f0f;
+      --card: #1a1a1a;
+      --text: #e8e8e8;
+      --muted: #909090;
+      --line: #2c2c2c;
+      --accent: #60a5fa;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .wrap { max-width: 620px; margin: 0 auto; }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    .sub { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .sec {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .04em;
+    }
+    .sec .count-badge {
+      margin-left: 6px;
+      padding: 0 6px;
+      border-radius: 999px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+    }
+
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex: none; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch span {
+      position: absolute; inset: 0; cursor: pointer;
+      background: var(--line); border-radius: 999px; transition: .18s;
+    }
+    .switch span::before {
+      content: ""; position: absolute; left: 3px; top: 3px;
+      width: 18px; height: 18px; border-radius: 50%;
+      background: #fff; transition: .18s;
+    }
+    .switch input:checked + span { background: var(--accent); }
+    .switch input:checked + span::before { transform: translateX(20px); }
+    .switch input:disabled + span { opacity: .5; cursor: default; }
+
+    .row { display: flex; gap: 8px; }
+    input[type="text"] {
+      flex: 1; min-width: 0;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: transparent;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+    input[type="text"]:disabled { opacity: .45; }
+
+    button {
+      padding: 9px 16px;
+      border: none;
+      border-radius: 9px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:active { transform: scale(.98); }
+
+    .tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .empty { color: var(--muted); font-size: 13px; }
+    .tag {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 8px 4px 10px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 13px;
+    }
+    .tag b {
+      cursor: pointer;
+      color: var(--muted);
+      font-weight: 400;
+      font-size: 15px;
+      line-height: 1;
+    }
+    .tag b:hover { color: var(--danger); }
+
+    .type {
+      display: grid;
+      grid-template-columns: 172px 1fr;
+      gap: 12px;
+      align-items: center;
+      padding: 9px 0;
+    }
+    .type + .type { border-top: 1px dashed var(--line); }
+    .type label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+    .type label:has(input:disabled) { opacity: .5; cursor: default; }
+    .type small {
+      display: block;
+      margin-left: 22px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    @media (max-width: 520px) {
+      .type { grid-template-columns: 1fr; gap: 6px; }
+    }
+
+    .opts { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+    .opts label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); cursor: pointer; }
+    .opts label.sub { margin-left: 20px; }
+    .opts label:has(input:disabled) { opacity: .45; cursor: default; }
+
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
+    .err { margin: 6px 0 0; color: var(--danger); font-size: 12px; min-height: 18px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>消息撤回</h1>
+        <p class="sub">关键词 / 号码 / 链接 / 二维码 / Emoji，命中即由机器人撤回</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="enabled" />
+        <span></span>
+      </label>
+    </header>
+
+    <section class="card">
+      <div class="sec">撤回类型与各自的提示</div>
+
+      <div class="type">
+        <label><input type="checkbox" id="t-keyword" /> 关键词</label>
+        <input type="text" id="r-keyword" maxlength="200" placeholder="命中后的回复，留空则不发" />
+      </div>
+
+      <div class="type">
+        <div>
+          <label><input type="checkbox" id="t-number" /> 号码</label>
+          <small>5 位及以上连续数字</small>
+        </div>
+        <input type="text" id="r-number" maxlength="200" placeholder="命中后的回复，留空则不发" />
+      </div>
+
+      <div class="type">
+        <div>
+          <label><input type="checkbox" id="t-link" /> 链接</label>
+          <small>网址、域名、裸 IP</small>
+        </div>
+        <input type="text" id="r-link" maxlength="200" placeholder="命中后的回复，留空则不发" />
+      </div>
+
+      <div class="type">
+        <div>
+          <label><input type="checkbox" id="t-qrcode" /> 二维码</label>
+          <small>图片里能扫出二维码</small>
+        </div>
+        <input type="text" id="r-qrcode" maxlength="200" placeholder="命中后的回复，留空则不发" />
+      </div>
+
+      <div class="type">
+        <div>
+          <label><input type="checkbox" id="t-emoji" /> Emoji</label>
+          <small>😀 这类字符，不含 QQ 表情</small>
+        </div>
+        <input type="text" id="r-emoji" maxlength="200" placeholder="命中后的回复，留空则不发" />
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="sec">关键词词表<span class="count-badge" id="kwCount">0</span></div>
+      <div class="row">
+        <input type="text" id="input" maxlength="50" placeholder="输入关键词，回车添加" />
+        <button id="add">添加</button>
+      </div>
+      <div class="tags" id="tags"></div>
+    </section>
+
+    <section class="card opts">
+      <label><input type="checkbox" id="notify" /> 撤回后发送提示（总开关）</label>
+      <label class="sub"><input type="checkbox" id="notifyAt" /> 提示时 @ 被撤回的人</label>
+    </section>
+
+    <footer>
+      <span id="count">已撤回 0 条</span>
+      <span id="saved"></span>
+    </footer>
+
+    <p class="hint">号码按“连续 5 位及以上”判断，中间断开不算；链接认协议头、常见域名后缀和裸 IP；二维码会下载图片解码；Emoji 只认 😀 这类 Unicode 字符，出现一个就撤，QQ 自带表情（小黄脸、表情包）不撤。@ 和表情的标记会先剥离再判断，不会因为 openid 里的数字被当成号码。需要机器人是群管理员，且消息在 2 分钟内；群主/管理员的消息不会被撤回。</p>
+    <p class="err" id="err"></p>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

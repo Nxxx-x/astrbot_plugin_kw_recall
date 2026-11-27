@@ -1,0 +1,8 @@
+{
+  "views": {
+    "keywords": {
+      "title": "消息撤回",
+      "description": "关键词、号码、链接、二维码、Emoji 五类撤回开关与各自的提示文案"
+    }
+  }
+}
