@@ -1,10 +1,4 @@
 {
-  "enabled": {
-    "description": "总开关",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后任何规则都不生效，消息一律不撤"
-  },
   "notify": {
     "description": "撤回后发送提示",
     "type": "bool",
@@ -31,7 +25,7 @@
         "description": "关键词列表",
         "type": "text",
         "default": "",
-        "hint": "一行一个，最多 200 个，每个最长 50 字。建议每个词 2 字以上，太短容易误撤。也可以群里用 /撤回词 +词 增删"
+        "hint": "一行一个，最多 200 个，每个最长 50 字。建议每个词 2 字以上，太短容易误撤"
       },
       "reply": {
         "description": "提示文案",
@@ -49,7 +43,7 @@
       "enabled": {
         "description": "启用号码撤回",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "reply": {
         "description": "提示文案",
@@ -67,7 +61,7 @@
       "enabled": {
         "description": "启用链接撤回",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "reply": {
         "description": "提示文案",
@@ -85,7 +79,7 @@
       "enabled": {
         "description": "启用二维码撤回",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "reply": {
         "description": "提示文案",
@@ -103,7 +97,7 @@
       "enabled": {
         "description": "启用 Emoji 撤回",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "reply": {
         "description": "提示文案",

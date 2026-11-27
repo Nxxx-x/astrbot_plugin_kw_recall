@@ -1,10 +1,11 @@
 """消息撤回 · 面向 QQ 官方机器人适配器（qq_official / qq_official_webhook）。
 
-支持五类命中：关键词、5 位及以上连续数字、链接、二维码图片、Emoji，每类可单独
-开关并配置各自的撤回提示。群消息命中后调用官方 DELETE 接口撤回。
+支持五类命中：关键词、5 位及以上连续数字、链接、二维码图片、Emoji，五类默认全部
+开启，命中后调用官方 DELETE 接口撤回。
 
-所有配置项定义在 _conf_schema.json，在 AstrBot 管理面板 → 插件 → 本插件 → 配置
-里修改，保存后即时生效（插件读取的是同一份 config 对象）。
+配置全部在 _conf_schema.json，到 AstrBot 管理面板 → 插件 → 本插件 → 配置里改，
+保存即生效（插件读的就是同一份 config 对象）。插件不注册任何聊天指令，群里发
+/撤回xx 之类不会被拦截。
 
 官机撤回的三个前提，写死在 README 里，代码这边只做兜底：
 1. 只能撤回 2 分钟内发送的消息，超时返回 40064004；
@@ -55,20 +56,6 @@ LINK_RE = re.compile(
 )
 
 TYPE_KEYS = ("keyword", "number", "link", "qrcode", "emoji")
-TYPE_LABELS = {
-    "keyword": "关键词",
-    "number": "号码",
-    "link": "链接",
-    "qrcode": "二维码",
-    "emoji": "Emoji",
-}
-TYPE_COMMANDS = {
-    "keyword": "撤回关键词",
-    "number": "撤回号码",
-    "link": "撤回链接",
-    "qrcode": "撤回二维码",
-    "emoji": "撤回表情",
-}
 DEFAULT_REPLIES = {
     "keyword": "消息含有关键词，已撤回",
     "number": "请勿发送号码，已撤回",
@@ -76,13 +63,13 @@ DEFAULT_REPLIES = {
     "qrcode": "请勿发送二维码，已撤回",
     "emoji": "请勿刷屏表情，已撤回",
 }
-# 只有关键词默认开启，其余四类默认关闭，避免装完就误伤
+# 五类规则默认全部开启，装完即生效；不想要哪一类就去配置里单独关掉
 DEFAULT_ENABLED = {
     "keyword": True,
-    "number": False,
-    "link": False,
-    "qrcode": False,
-    "emoji": False,
+    "number": True,
+    "link": True,
+    "qrcode": True,
+    "emoji": True,
 }
 
 # QQ 官机的原生表情（含超级表情、收藏的表情包）不以 Unicode 字符下发，
@@ -176,8 +163,6 @@ class MessageRecall(Star):
         super().__init__(context)
         # AstrBotConfig 继承自 dict；缺失时退化为空字典，靠代码里的默认值兜底
         self.config = config if isinstance(config, dict) else {}
-        self._count = 0
-        self._last_error = ""
         self._qr_detector = None
         self._qr_missing_warned = False
         self._qr_lock = asyncio.Lock()
@@ -189,9 +174,6 @@ class MessageRecall(Star):
     def _group(self, key: str) -> dict[str, Any]:
         raw = self.config.get(key)
         return raw if isinstance(raw, dict) else {}
-
-    def _enabled(self) -> bool:
-        return bool(self.config.get("enabled", True))
 
     def _notify(self) -> bool:
         return bool(self.config.get("notify", False))
@@ -214,26 +196,6 @@ class MessageRecall(Star):
 
     def _active_types(self) -> list[str]:
         return [key for key in TYPE_KEYS if self._on(key)]
-
-    async def _persist(self) -> bool:
-        """把改动写回 data/config/<plugin>_config.json。"""
-        try:
-            saver = getattr(self.config, "save_config_async", None)
-            if callable(saver):
-                await saver()
-            else:
-                self.config.save_config()  # type: ignore[attr-defined]
-            return True
-        except Exception as exc:
-            logger.warning(f"[kw_recall] 配置保存失败：{exc}")
-            return False
-
-    def _set_group(self, key: str, field: str, value: Any) -> None:
-        group = self.config.get(key)
-        if not isinstance(group, dict):
-            group = {}
-            self.config[key] = group
-        group[field] = value
 
     # ------------------------------------------------------------------
     # 匹配
@@ -432,9 +394,6 @@ class MessageRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
-        if not self._enabled():
-            return
-
         active = self._active_types()
         if not active:
             return
@@ -462,12 +421,9 @@ class MessageRecall(Star):
             await self._recall_group_message(event, message_id)
         except Exception as exc:  # 撤回失败不影响后续消息处理
             logger.warning(f"[kw_recall] 撤回失败（{reason}）：{exc}")
-            self._last_error = str(exc)[:200]
             return
 
         logger.info(f"[kw_recall] 已撤回消息，原因：{reason}")
-        self._count += 1
-        self._last_error = ""
 
         reply_text = self._reply(hit_type)
         if self._notify() and reply_text:
@@ -479,202 +435,3 @@ class MessageRecall(Star):
                 )
             else:
                 yield event.plain_result(reply_text)
-
-    # ------------------------------------------------------------------
-    # 群指令（手机上临时改配置用，改动会写回插件配置文件）
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _arg(event: AstrMessageEvent, index: int = 1) -> str:
-        parts = (event.message_str or "").strip().split(maxsplit=index)
-        return parts[index].strip() if len(parts) > index else ""
-
-    def _status_lines(self) -> list[str]:
-        kws = self._keywords()
-        lines = [
-            f"总开关：{'开启' if self._enabled() else '关闭'}",
-            f"关键词：{'开启' if self._on('keyword') else '关闭'}（{len(kws)} 个）",
-            f"号码：{'开启' if self._on('number') else '关闭'}（5 位及以上连续数字）",
-            f"链接：{'开启' if self._on('link') else '关闭'}",
-            f"二维码：{'开启' if self._on('qrcode') else '关闭'}",
-            f"Emoji：{'开启（有就撤）' if self._on('emoji') else '关闭'}",
-            f"撤回后提示：{'开启' if self._notify() else '关闭'}"
-            f"{'（@ 被撤回的人）' if self._notify_at() else ''}",
-            f"本次运行累计撤回 {self._count} 条",
-        ]
-        if self._last_error:
-            lines.append(f"最近一次失败：{self._last_error}")
-        return lines
-
-    @filter.command("撤回词", alias={"kw"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def manage(self, event: AstrMessageEvent):
-        """管理关键词：/撤回词 查看 | /撤回词 +词 | /撤回词 -词"""
-        arg = self._arg(event)
-
-        if not arg:
-            kws = self._keywords()
-            body = "、".join(kws) if kws else "（空）"
-            yield event.plain_result(
-                "\n".join(
-                    self._status_lines()
-                    + [
-                        f"词表：{body}",
-                        "用法：/撤回词 +新词、/撤回词 -旧词",
-                    ]
-                )
-            )
-            return
-
-        action = arg[0]
-        word = arg[1:].strip()[:MAX_KEYWORD_LEN]
-        if action not in ("+", "-") or not word:
-            yield event.plain_result(
-                "用法：/撤回词 +新词 或 /撤回词 -旧词"
-            )
-            return
-
-        words = self._keywords()
-        if action == "+":
-            if word in words:
-                yield event.plain_result(f"「{word}」已经在词表里了")
-                return
-            if len(words) >= MAX_KEYWORDS:
-                yield event.plain_result(f"词表已满（{MAX_KEYWORDS} 个），先删几个")
-                return
-            words.append(word)
-            message = f"已添加「{word}」，当前 {len(words)} 个"
-        else:
-            if word not in words:
-                yield event.plain_result(f"词表里没有「{word}」")
-                return
-            words.remove(word)
-            message = f"已删除「{word}」，当前 {len(words)} 个"
-
-        self._set_group("keyword", "list", "\n".join(words))
-        await self._persist()
-        yield event.plain_result(message)
-
-    async def _toggle(self, event: AstrMessageEvent, key: str, tip: str):
-        arg = self._arg(event).lower()
-        label = TYPE_LABELS[key]
-        current = self._on(key)
-
-        if arg in ("开", "开启", "on", "1", "true", "启用"):
-            target = True
-        elif arg in ("关", "关闭", "off", "0", "false", "停用"):
-            target = False
-        elif not arg:
-            yield event.plain_result(
-                f"{label}撤回当前{'开启' if current else '关闭'}。"
-                f"用法：/{TYPE_COMMANDS[key]} 开|关"
-            )
-            return
-        else:
-            yield event.plain_result(f"用法：/{TYPE_COMMANDS[key]} 开|关")
-            return
-
-        if target == current:
-            yield event.plain_result(
-                f"{label}撤回{'已经是开启' if target else '已经是关闭'}状态"
-            )
-            return
-
-        self._set_group(key, "enabled", target)
-        ok = await self._persist()
-        suffix = "" if ok else "（配置写回失败，重启后可能丢失）"
-        yield event.plain_result(
-            f"{label}撤回已{'开启' if target else '关闭'}{tip}{suffix}"
-        )
-
-    @filter.command("撤回关键词", alias={"kwnkw"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_keywords(self, event: AstrMessageEvent):
-        """开关关键词撤回：/撤回关键词 开 | /撤回关键词 关"""
-        async for result in self._toggle(event, "keyword", "：消息包含词表内容会被撤回"):
-            yield result
-
-    @filter.command("撤回号码", alias={"kwnnum"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_numbers(self, event: AstrMessageEvent):
-        """开关号码撤回：/撤回号码 开 | /撤回号码 关"""
-        async for result in self._toggle(
-            event, "number", "：5 位及以上连续数字会被撤回"
-        ):
-            yield result
-
-    @filter.command("撤回链接", alias={"kwnlink"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_links(self, event: AstrMessageEvent):
-        """开关链接撤回：/撤回链接 开 | /撤回链接 关"""
-        async for result in self._toggle(event, "link", "：消息含链接会被撤回"):
-            yield result
-
-    @filter.command("撤回二维码", alias={"kwnqr"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_qrcodes(self, event: AstrMessageEvent):
-        """开关二维码撤回：/撤回二维码 开 | /撤回二维码 关"""
-        async for result in self._toggle(
-            event, "qrcode", "：消息含二维码图片会被撤回"
-        ):
-            yield result
-
-    @filter.command("撤回表情", alias={"kwnemoji"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def toggle_emoji(self, event: AstrMessageEvent):
-        """开关表情撤回：/撤回表情 开 | /撤回表情 关"""
-        async for result in self._toggle(event, "emoji", "：消息含 emoji 字符会被撤回"):
-            yield result
-
-    @filter.command("撤回回复", alias={"kwnreply"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def set_reply(self, event: AstrMessageEvent):
-        """设置各类撤回提示：/撤回回复 链接 文案（文案填 - 表示清空）"""
-        arg = self._arg(event)
-        if not arg:
-            lines = [
-                f"{TYPE_LABELS[key]}：{self._reply(key) or '（不发提示）'}"
-                for key in TYPE_KEYS
-            ]
-            yield event.plain_result(
-                "\n".join(
-                    [f"撤回后提示：{'开启' if self._notify() else '关闭'}"]
-                    + lines
-                    + ["用法：/撤回回复 链接 请勿发链接"]
-                )
-            )
-            return
-
-        parts = arg.split(maxsplit=1)
-        name = parts[0]
-        content = parts[1].strip() if len(parts) > 1 else ""
-
-        key = next(
-            (
-                k
-                for k in TYPE_KEYS
-                if name in (k, TYPE_LABELS[k]) or (k == "emoji" and name == "表情")
-            ),
-            None,
-        )
-        if key is None:
-            yield event.plain_result(
-                "类型只能是：关键词、号码、链接、二维码、Emoji。"
-                "例：/撤回回复 链接 请勿发链接"
-            )
-            return
-        if not content:
-            yield event.plain_result(
-                f"用法：/撤回回复 {TYPE_LABELS[key]} 文案，文案填 - 表示不发送提示"
-            )
-            return
-
-        text = "" if content == "-" else content.strip()[:MAX_REPLY_LEN]
-        self._set_group(key, "reply", text)
-        ok = await self._persist()
-        suffix = "" if ok else "（配置写回失败，重启后可能丢失）"
-
-        if text:
-            yield event.plain_result(f"{TYPE_LABELS[key]}撤回提示已改为：{text}{suffix}")
-        else:
-            yield event.plain_result(f"{TYPE_LABELS[key]}撤回后不再发送提示{suffix}")
