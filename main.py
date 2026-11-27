@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from collections import OrderedDict
 from typing import Any
 
 import astrbot.api.message_components as Comp
@@ -88,30 +89,28 @@ def _strip_markup(text: str) -> str:
     return AT_TAG_RE.sub("", FACE_TAG_RE.sub("", text))
 
 
-# 标准库 re 没有 Unicode 属性，只能按区段兜底；装了 regex 就用字素簇 +
-# Extended_Pictographic，能正确把 👨‍👩‍👧、👍🏽、🇨🇳 各算成一个。
+# 标准库 re 没有 Unicode 属性，只能按区段兜底；装了 regex 就用
+# Extended_Pictographic / Regional_Indicator 精确判断，标签描述里的汉字不会被误判。
 try:  # pragma: no cover - 取决于环境
     import regex as _regex
 
-    _CLUSTER_RE: Any = _regex.compile(r"\X")
     _PICTO_RE: Any = _regex.compile(
         r"\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3"
     )
 except Exception:  # pragma: no cover
-    _CLUSTER_RE = None
     _PICTO_RE = None
 
 FALLBACK_EMOJI_RE = re.compile(
     "["
-    "\U0001F000-\U0001FAFF"
-    "\U0001F1E6-\U0001F1FF"
-    "\u2600-\u27BF"
-    "\u2B00-\u2BFF"
-    "\u2194-\u2199\u21A9-\u21AA"
-    "\u2300-\u23FF"
-    "\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE"
-    "\u00A9\u00AE\u203C\u2049\u2122\u2139\u24C2"
-    "\u3030\u303D\u3297\u3299\u20E3"
+    "\U0001f000-\U0001faff"
+    "\U0001f1e6-\U0001f1ff"
+    "\u2600-\u27bf"
+    "\u2b00-\u2bff"
+    "\u2194-\u2199\u21a9-\u21aa"
+    "\u2300-\u23ff"
+    "\u25aa-\u25ab\u25b6\u25c0\u25fb-\u25fe"
+    "\u00a9\u00ae\u203c\u2049\u2122\u2139\u24c2"
+    "\u3030\u303d\u3297\u3299\u20e3"
     "]"
 )
 
@@ -122,23 +121,33 @@ KEYCAP_RE = re.compile(r"[0-9#*]\ufe0f?\u20e3")
 MAX_IMAGES_PER_MESSAGE = 4
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+# 单张图的下载与解码上限，防止一张超大图长期占着线程
+IMAGE_DOWNLOAD_TIMEOUT = 8
+QR_DECODE_TIMEOUT = 10
+# 同一张图（同一 URL / 文件名）只解码一次，群里反复转发的表情包不再重复算
+QR_CACHE_SIZE = 256
+QR_CONCURRENCY = 2
 
-def _count_emoji(text: str) -> int:
-    """统计 Unicode emoji 字符个数，如 😀 ❤️ 👍。
+# 官机撤回的两类"预期内"失败：消息已超 2 分钟（40064004）、机器人没有群管理
+# 权限（40062003）。这类不刷 warning，否则群里一条漏撤就报一次，日志会被冲爆。
+RECALL_EXPIRED = "40064004"
+RECALL_FORBIDDEN = "40062003"
 
+
+def _has_emoji(text: str) -> bool:
+    """判断文本里有没有 Unicode emoji（😀 ❤️ 👍 这类），有一个就算命中。
+
+    规则只关心"有没有"，找到第一个就返回，不做全量计数——群里大部分消息
+    不含表情，短路判断比逐簇统计省一大截。
     QQ 原生表情 / 超级表情（适配器转成的 [表情:捂脸]、[表情]）不算 emoji，
-    这类是 QQ 自带表情，不属于本规则；统计前先把这些标签剥掉，避免标签里的
-    描述文字（如「满头问号」）被当成消息正文。@ 标签同理。
+    这些标签和 @ 标签在判断前统一剥掉，避免标签里的描述文字干扰。
     """
     rest = _strip_markup(text)
 
-    if _CLUSTER_RE is not None and _PICTO_RE is not None:
-        return sum(
-            1 for item in _CLUSTER_RE.finditer(rest) if _PICTO_RE.search(item.group())
-        )
+    if _PICTO_RE is not None:
+        return _PICTO_RE.search(rest) is not None
 
-    keycaps = len(KEYCAP_RE.findall(rest))
-    return len(FALLBACK_EMOJI_RE.findall(KEYCAP_RE.sub("", rest))) + keycaps
+    return bool(FALLBACK_EMOJI_RE.search(rest) or KEYCAP_RE.search(rest))
 
 
 def _parse_keywords(raw: Any) -> list[str]:
@@ -165,7 +174,12 @@ class MessageRecall(Star):
         self.config = config if isinstance(config, dict) else {}
         self._qr_detector = None
         self._qr_missing_warned = False
-        self._qr_lock = asyncio.Lock()
+        # 解码是 CPU 密集操作，用信号量限制并发；同时避免把事件循环线程池占满
+        self._qr_sem = asyncio.Semaphore(QR_CONCURRENCY)
+        self._qr_cache: OrderedDict[str, str] = OrderedDict()
+        # 词表解析结果缓存：配置对象每被保存一次，原始文本才变，届时自动重算
+        self._kw_raw: Any = None
+        self._kw_pairs: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -191,8 +205,14 @@ class MessageRecall(Star):
             raw = DEFAULT_REPLIES[key]
         return str(raw).strip()[:MAX_REPLY_LEN]
 
-    def _keywords(self) -> list[str]:
-        return _parse_keywords(self._group("keyword").get("list", ""))
+    def _keyword_pairs(self) -> list[tuple[str, str]]:
+        """返回 (原词, 小写词)；配置没改时直接复用缓存，避免每条消息重解析+重 lower。"""
+        raw = self._group("keyword").get("list", "")
+        if raw == self._kw_raw:
+            return self._kw_pairs
+        self._kw_raw = raw
+        self._kw_pairs = [(word, word.lower()) for word in _parse_keywords(raw)]
+        return self._kw_pairs
 
     def _active_types(self) -> list[str]:
         return [key for key in TYPE_KEYS if self._on(key)]
@@ -210,9 +230,9 @@ class MessageRecall(Star):
 
         if self._on("keyword"):
             lowered = text.lower()
-            for kw in self._keywords():
-                if kw.lower() in lowered:
-                    return "keyword", f"关键词「{kw}」"
+            for word, lowered_word in self._keyword_pairs():
+                if lowered_word in lowered:
+                    return "keyword", f"关键词「{word}」"
 
         if self._on("link"):
             found = LINK_RE.search(text)
@@ -224,10 +244,8 @@ class MessageRecall(Star):
             if found:
                 return "number", f"号码 {found.group(0)}"
 
-        if self._on("emoji"):
-            count = _count_emoji(text)
-            if count:
-                return "emoji", f"{count} 个 emoji"
+        if self._on("emoji") and _has_emoji(text):
+            return "emoji", "含 emoji"
 
         return None
 
@@ -243,20 +261,49 @@ class MessageRecall(Star):
 
         images = [c for c in components if isinstance(c, Comp.Image)]
         for image in images[:MAX_IMAGES_PER_MESSAGE]:
+            key = self._image_key(image)
+            if key and key in self._qr_cache:
+                content = self._qr_cache[key]
+                if content:
+                    return "qrcode", f"二维码（{content[:30]}）"
+                continue
+
             path = await self._image_path(image)
             if not path:
                 continue
             content = await self._decode_qr(path)
+            if key:
+                self._remember_qr(key, content)
             if content:
                 return "qrcode", f"二维码（{content[:30]}）"
         return None
+
+    @staticmethod
+    def _image_key(image: Any) -> str:
+        """给图片取一个稳定标识，用来命中解码缓存。
+
+        官机图片的 url 带时效签名，同一张图重新转发时 url 会变，所以优先用
+        框架落盘路径与文件名（AstrBot 按内容命名），url 只作兜底。
+        """
+        for attr in ("path", "file", "url"):
+            value = getattr(image, attr, "")
+            if isinstance(value, str) and value:
+                return f"{len(value)}:{value[:180]}"
+        return ""
+
+    def _remember_qr(self, key: str, content: str) -> None:
+        """记下"这张图有没有二维码"，超出容量按最久未用淘汰。"""
+        self._qr_cache[key] = content
+        self._qr_cache.move_to_end(key)
+        while len(self._qr_cache) > QR_CACHE_SIZE:
+            self._qr_cache.popitem(last=False)
 
     async def _image_path(self, image: Any) -> str:
         convert = getattr(image, "convert_to_file_path", None)
         if not callable(convert):
             return ""
         try:
-            path = await asyncio.wait_for(convert(), timeout=8)
+            path = await asyncio.wait_for(convert(), timeout=IMAGE_DOWNLOAD_TIMEOUT)
         except Exception as exc:
             logger.debug(f"[kw_recall] 图片下载失败：{exc}")
             return ""
@@ -319,9 +366,19 @@ class MessageRecall(Star):
         detector = self._get_qr_detector()
         if detector is None:
             return ""
-        # 解码是 CPU 密集操作，放线程池；detector 复用，加锁避免并发调用
-        async with self._qr_lock:
-            return await asyncio.to_thread(self._decode_qr_sync, detector, path)
+        # 解码是 CPU 密集操作，放线程池并限并发；超时直接放弃，别拖住消息处理
+        async with self._qr_sem:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._decode_qr_sync, detector, path),
+                    timeout=QR_DECODE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[kw_recall] 二维码解码超时，跳过")
+                return ""
+            except Exception as exc:
+                logger.debug(f"[kw_recall] 二维码解码异常：{exc}")
+                return ""
 
     @staticmethod
     def _decode_qr_sync(detector, path: str) -> str:
@@ -341,21 +398,14 @@ class MessageRecall(Star):
         if image is None:
             return ""
 
+        # 只判定"有没有码 + 码里是什么"，取第一个即可，不需要 multi 解码
         for candidate in MessageRecall._qr_candidates(image, cv2):
             try:
-                ok, texts, _points, _ = detector.detectAndDecodeMulti(candidate)
+                text, _points, _ = detector.detectAndDecode(candidate)
             except Exception:
-                try:
-                    text, _points, _ = detector.detectAndDecode(candidate)
-                except Exception:
-                    continue
-                if text:
-                    return text
                 continue
-            if ok and texts:
-                for item in texts:
-                    if item:
-                        return item
+            if text:
+                return text
         return ""
 
     # ------------------------------------------------------------------
@@ -367,7 +417,8 @@ class MessageRecall(Star):
         """群主 / 管理员发的消息不撤，避免得罪人和无权限报错。"""
         raw = getattr(event.message_obj, "raw_message", None)
         author = getattr(raw, "author", None)
-        return getattr(author, "member_role", "member") in ("owner", "admin")
+        role = getattr(author, "member_role", "") or ""
+        return role.lower() in ("owner", "admin", "administrator")
 
     async def _recall_group_message(
         self, event: AstrMessageEvent, message_id: str
@@ -379,13 +430,19 @@ class MessageRecall(Star):
         if bot is None:
             raise RuntimeError("当前适配器不支持撤回")
 
+        # botpy 各版本挂载位置略有差异：新版在 api._http，旧版在 api.http
+        api = getattr(bot, "api", None)
+        http = getattr(api, "_http", None) or getattr(api, "http", None)
+        if http is None:
+            raise RuntimeError("当前 botpy 版本不支持该撤回接口")
+
         route = Route(
             "DELETE",
             "/v2/groups/{group_openid}/messages/{message_id}",
-            group_openid=event.get_group_id(),
-            message_id=message_id,
+            group_openid=str(event.get_group_id()),
+            message_id=str(message_id),
         )
-        await bot.api._http.request(route)
+        await http.request(route)
 
     # ------------------------------------------------------------------
     # 消息监听
@@ -394,10 +451,11 @@ class MessageRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
+        """群消息入口：命中任一规则就撤回，按配置发提示。"""
         active = self._active_types()
         if not active:
             return
-        if active == ["keyword"] and not self._keywords():
+        if active == ["keyword"] and not self._keyword_pairs():
             # 只剩关键词但词表是空的，没什么可匹配
             return
 
@@ -420,18 +478,23 @@ class MessageRecall(Star):
         try:
             await self._recall_group_message(event, message_id)
         except Exception as exc:  # 撤回失败不影响后续消息处理
-            logger.warning(f"[kw_recall] 撤回失败（{reason}）：{exc}")
+            detail = str(exc)
+            if RECALL_EXPIRED in detail or RECALL_FORBIDDEN in detail:
+                logger.debug(f"[kw_recall] 未能撤回（{reason}）：{detail[:120]}")
+            else:
+                logger.warning(f"[kw_recall] 撤回失败（{reason}）：{detail[:200]}")
             return
 
         logger.info(f"[kw_recall] 已撤回消息，原因：{reason}")
 
         reply_text = self._reply(hit_type)
         if self._notify() and reply_text:
-            if self._notify_at():
+            sender_id = event.get_sender_id()
+            if self._notify_at() and sender_id:
                 # 官机会把 At 转成 <qqbot-at-user id="openid" /> 内联进文本，
                 # openid 正好就是发送者 ID。
                 yield event.chain_result(
-                    [Comp.At(qq=event.get_sender_id()), Comp.Plain(f" {reply_text}")]
+                    [Comp.At(qq=sender_id), Comp.Plain(f" {reply_text}")]
                 )
             else:
                 yield event.plain_result(reply_text)

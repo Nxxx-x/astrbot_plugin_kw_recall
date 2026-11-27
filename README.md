@@ -12,6 +12,7 @@ astrbot_plugin_kw_recall/
 ├── _conf_schema.json    # 配置项定义（决定管理面板里显示什么）
 ├── metadata.yaml        # 插件元数据
 ├── requirements.txt     # 依赖（opencv、regex，均可选）
+├── pyproject.toml       # ruff 检查/格式化配置（开发用，运行不需要）
 └── README.md
 ```
 
@@ -61,6 +62,18 @@ git clone https://github.com/Nxxx-x/astrbot_plugin_kw_recall.git
 
 匹配顺序为关键词 → 链接 → 号码 → Emoji，二维码只在文本没命中时才去解码图片。
 
+## 性能处理
+
+群消息是高频路径，每条都会过一遍规则，所以做了几处收敛：
+
+- **词表缓存**：关键词列表只在配置文本变化时重新解析，并且预先存好小写形式，匹配时每条消息只 lower 一次正文；
+- **Emoji 短路**：规则只要"有没有"，命中第一个就返回，不做全量计数；
+- **二维码缓存**：同一张图（按落盘文件名 / URL 判定）只解码一次，最多记 256 条，超出按最久未用淘汰；群里反复转发的图不会再算第二遍；
+- **解码限流**：二维码解码放在线程池，最多 2 个并发，单张限时 10 秒，避免一张九宫格把事件循环拖住；
+- **提示日志分级**：超时（`40064004`）和无权限（`40062003`）只写 debug，其他异常才 warning，不会因为群里一条漏撤刷满日志。
+
+开发时可跑 `ruff format . && ruff check .`，配置在 `pyproject.toml` 里，目标版本按 Python 3.10。
+
 ## QQ 自带表情和 @ 不参与判断
 
 QQ 原生表情（小黄脸、超级表情）在官机里不是字符，适配器会转成 `[表情:捂脸]` 标签；@ 则是 `<qqbot-at-user id="openid" />` 或 `<@!openid>`。两者都会留在 `message_str` 里。
@@ -90,4 +103,5 @@ QQ 原生表情（小黄脸、超级表情）在官机里不是字符，适配�
 ## 已知限制
 
 - 图片形式的贴纸、GIF 表情包不是字符，Emoji 规则抓不到；
-- 群消息撤回没有官方 SDK 封装，直接发 `DELETE /v2/groups/{group_openid}/messages/{message_id}`。
+- 群消息撤回没有官方 SDK 封装，直接发 `DELETE /v2/groups/{group_openid}/messages/{message_id}`；botpy 新旧版本挂载位置不同（`api._http` / `api.http`），代码里都做了兜底；
+- 官方文档对群消息里 @ 的支持并不明确，若发现「提示时 @ 人」在你的群里渲染成纯文字或不合预期，直接把 `notify_at` 关掉即可。
