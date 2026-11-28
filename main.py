@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.11.2"
+PLUGIN_VERSION = "1.11.3"
 
 
 def _resolve_button_registrar():
@@ -129,7 +129,8 @@ SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
 # 面板正文不放字：按钮上已经写着「撤回关键词 开」，再写标题纯属重复。
-# 官机没有纯按钮消息，正文总要占一行，所以先试空串，平台不收时才用零宽空格占位。
+# 官机没有纯按钮消息，正文总得给点什么；但不能给空串——空串会被平台收下、
+# 同时把 keyboard 丢掉，群里就只剩一个空白气泡。零宽空格是唯一安全的下限。
 EMPTY_TEXT = "\u200b"
 BUTTON_ID_PREFIX = "kwrecall_"
 # 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
@@ -354,12 +355,10 @@ class MessageRecall(Star):
         AstrBot 自己的 keyboard 序列化把 permission 写死成 2（所有人可点），
         所以这里绕开它自己拼 payload，换成 1（仅群主/管理员可点）。
 
-        官机没有「只有按钮」的消息类型，按钮必须挂在 text / markdown 正文上，
-        正文再空也会占一行，所以按「空白从小到大」挨个试：
-          1. markdown 正文空串——平台若放行，气泡里就只剩按钮，一点空白都没有；
-          2. 纯文本零宽空格——纯文本气泡行高比 markdown 段落矮，空白明显更小；
-          3. markdown 零宽空格——最保底的一种，前两种都被拒时用。
-        每一档都先试被动回复（带 msg_id），再试主动发送。
+        官机没有「只有按钮」的消息类型，按钮必须挂在 text / markdown 正文上。
+        正文不能发空串：平台会收下这条消息、但把 keyboard 整个丢掉，群里只剩
+        一个空格（v1.11.2 踩过这个坑）。所以正文最少也要给一个零宽空格，先按
+        markdown 发（观感最好），被拒再退纯文本，每档都先试被动回复再试主动发送。
         """
         api = getattr(getattr(event, "bot", None), "api", None)
         group_id = event.get_group_id()
@@ -373,7 +372,7 @@ class MessageRecall(Star):
             # 有真文字时按老顺序：markdown 观感更好，被拒再退纯文本
             variants = ((True, text), (False, text))
         else:
-            variants = ((True, ""), (False, EMPTY_TEXT), (True, EMPTY_TEXT))
+            variants = ((True, EMPTY_TEXT), (False, EMPTY_TEXT))
 
         last: Exception | None = None
         for with_md, content in variants:
