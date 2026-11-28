@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import re
@@ -44,9 +45,37 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-# 新版 AstrBot 只把按钮事件派给带 ButtonActionFilter 的 handler，老版本没这个
-# 过滤器、按钮事件会走普通消息监听。两种都接上，按版本二选一。
-_BUTTON_FILTER = getattr(filter, "button_action", None)
+PLUGIN_VERSION = "1.10.0"
+
+
+def _resolve_button_registrar():
+    """找到「注册按钮点击 handler」的装饰器，找不到返回 None。
+
+    AstrBot 的唤醒检查里有一条硬规则：按钮事件只会派给带 ButtonActionFilter 的
+    handler，普通监听收不到。而注册这个过滤器有两处入口，不同版本导出情况不一样：
+
+    1. `astrbot.api.event.filter.button_action`（新版本才有，插件最常用）；
+    2. `astrbot.core.star.register.star_handler.register_button_action`（内部实现，
+       只要 AstrBot 认 ButtonActionFilter 就一定在）。
+
+    先试 1，再试 2；两处都没有说明这个版本压根不支持按钮事件，退回普通监听。
+    """
+    for module_name, attr in (
+        ("astrbot.api.event.filter", "button_action"),
+        ("astrbot.core.star.register.star_handler", "register_button_action"),
+        ("astrbot.core.star.register", "register_button_action"),
+    ):
+        try:
+            module = __import__(module_name, fromlist=[attr])
+            func = getattr(module, attr, None)
+            if callable(func):
+                return func
+        except Exception:  # 该版本没有这个模块，继续试下一个
+            continue
+    return getattr(filter, "button_action", None)
+
+
+BUTTON_REGISTRAR = _resolve_button_registrar()
 
 MAX_KEYWORDS = 200
 MAX_KEYWORD_LEN = 50
@@ -87,7 +116,7 @@ SWITCH_LABELS = {
 SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-MENU_TITLE = "撤回开关 · 点按钮切换（仅群主/管理员可点）"
+MENU_TITLE = f"撤回开关 · v{PLUGIN_VERSION} · 点按钮切换（仅群主/管理员可点）"
 NOTIFY_TITLE = "提示设置 · 点按钮切换（仅群主/管理员可点）"
 BUTTON_ID_PREFIX = "kwrecall_"
 # 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
@@ -216,6 +245,10 @@ class MessageRecall(Star):
         # 词表解析结果缓存：配置对象每被保存一次，原始文本才变，届时自动重算
         self._kw_raw: Any = None
         self._kw_pairs: list[tuple[str, str]] = []
+        logger.info(
+            f"[kw_recall] v{PLUGIN_VERSION} 已加载，按钮入口："
+            f"{'button_action' if BUTTON_REGISTRAR is not None else '普通监听（老版本兜底）'}"
+        )
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -383,56 +416,143 @@ class MessageRecall(Star):
         try:
             saver = getattr(self.config, "save_config_async", None)
             if callable(saver):
-                await saver()
-            else:
-                self.config.save_config()  # type: ignore[attr-defined]
+                # 新版返回布尔：False 表示被更新的快照顶掉了，也算没落盘
+                return await saver() is not False
+            self.config.save_config()  # type: ignore[attr-defined]
             return True
         except Exception as exc:
             logger.warning(f"[kw_recall] 配置保存失败：{exc}")
             return False
 
     @staticmethod
-    def _interaction_key(event: AstrMessageEvent) -> str:
+    def _key_from_values(data: Any, action_id: Any) -> str:
+        """从「回调数据 + 按钮 id」里认出被点的是哪个开关。
+
+        QQ 回传的三样东西版本间不一致：可能是 `{"k": "keyword"}` 字典、可能是
+        `kwrecall_keyword` 这种带前缀的字符串、也可能只有按钮 id。这里逐一尝试，
+        带不带前缀都认。
+        """
+        candidates: list[str] = []
+        if isinstance(data, dict):
+            for field in ("k", "key", "action_id", "id"):
+                value = data.get(field)
+                if isinstance(value, str):
+                    candidates.append(value)
+        elif isinstance(data, str):
+            candidates.append(data)
+        if action_id:
+            candidates.append(str(action_id))
+
+        for value in candidates:
+            key = value.strip().removeprefix(BUTTON_ID_PREFIX).strip()
+            if key in SWITCH_KEYS:
+                return key
+        return ""
+
+    @staticmethod
+    def _raw_resolved(event: AstrMessageEvent) -> Any:
+        """拿到原始 interaction 里的 data.resolved（组件不可用时的兜底来源）。"""
+        raw = getattr(event, "message_obj", None)
+        raw = getattr(raw, "raw_message", None)
+        resolved = getattr(getattr(raw, "data", None), "resolved", None)
+        return resolved
+
+    def _interaction_key(self, event: AstrMessageEvent) -> str:
         """从按钮点击事件里取出被点的开关名；不是按钮事件或参数不认识时返回空串。
 
-        权限不在代码里判：键盘是我们自己下发的，按钮带 permission.type=1，
-        QQ 只在群主/管理员点击时才把 INTERACTION_CREATE 推过来，普通成员点了
-        客户端直接拦掉，事件根本到不了这里。
+        取值的路子按可靠性排三条，任何一条能认出来就返回：
+        1. AstrBot 的 `get_button_interaction()`（它自己过滤器用的就是这个）；
+        2. 消息组件列表里的 ButtonInteraction；
+        3. 原始 interaction 的 `data.resolved`（组件类缺失/版本不匹配时兜底）。
+
+        权限不在代码里判：键盘是我们自己下发的，按钮带 permission.type=1，QQ 只在
+        群主/管理员点击时才推 INTERACTION_CREATE，普通成员点了客户端直接拦掉。
         """
-        if ButtonInteraction is None:
-            return ""
-        try:
-            components = event.get_messages() or []
-        except Exception:
-            return ""
+        # 1/2. 优先用官方取法，其次扫组件
+        component = None
+        getter = getattr(event, "get_button_interaction", None)
+        if callable(getter):
+            try:
+                component = getter()
+            except Exception:
+                component = None
+        if component is None and ButtonInteraction is not None:
+            try:
+                for item in event.get_messages() or []:
+                    if isinstance(item, ButtonInteraction):
+                        component = item
+                        break
+            except Exception:
+                component = None
+        if component is not None:
+            key = self._key_from_values(
+                getattr(component, "data", None),
+                getattr(component, "action_id", ""),
+            )
+            if key:
+                return key
 
-        for component in components:
-            if not isinstance(component, ButtonInteraction):
-                continue
-
-            key = ""
-            data = getattr(component, "data", None)
-            if isinstance(data, dict):
-                key = str(data.get("k", ""))
-            elif isinstance(data, str):
-                key = data.removeprefix(BUTTON_ID_PREFIX)
-            if key not in SWITCH_KEYS:
-                # 兜底：只带按钮 id 时按 id 反解
-                key = str(getattr(component, "action_id", "")).removeprefix(
-                    BUTTON_ID_PREFIX
-                )
-            return key if key in SWITCH_KEYS else ""
+        # 3. 原始 interaction 兜底
+        resolved = self._raw_resolved(event)
+        if resolved is not None:
+            return self._key_from_values(
+                getattr(resolved, "button_data", ""),
+                getattr(resolved, "button_id", ""),
+            )
         return ""
+
+    @staticmethod
+    def _describe_interaction(event: AstrMessageEvent) -> str:
+        """把点击事件里的关键字段拍成一行，认不出开关时用来排查。"""
+        parts: list[str] = []
+        getter = getattr(event, "get_button_interaction", None)
+        component = getter() if callable(getter) else None
+        if component is not None:
+            parts.append(f"action_id={getattr(component, 'action_id', '')!r}")
+            parts.append(f"data={getattr(component, 'data', None)!r}")
+        resolved = MessageRecall._raw_resolved(event)
+        if resolved is not None:
+            parts.append(f"button_id={getattr(resolved, 'button_id', '')!r}")
+            parts.append(f"button_data={getattr(resolved, 'button_data', '')!r}")
+        return " ".join(parts) or "无可用字段"
+
+    def _persisted_state(self, key: str) -> bool | None:
+        """从配置文件里读回某个开关，确认真的落盘了；读不到返回 None。
+
+        只用于排查：内存改了、文件没写进去（权限、被别的快照覆盖）这种情况，
+        光看群里回复是发现不了的。
+        """
+        path = getattr(self.config, "config_path", "")
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as file:
+                data = json.load(file)
+        except Exception:
+            return None
+        if key in TYPE_KEYS:
+            group = data.get(key)
+            if not isinstance(group, dict) or "enabled" not in group:
+                return None
+            return bool(group["enabled"])
+        if key not in data:
+            return None
+        return bool(data[key])
 
     async def _apply_toggle(self, key: str) -> str:
         """切换开关、写回配置，返回给群里的那行提示。"""
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
-        suffix = "" if saved else "（保存失败，重启后可能复原）"
         logger.info(
             f"[kw_recall] 面板切换 {SWITCH_LABELS[key]} → "
             f"{'开' if enabled else '关'}{'' if saved else '（未落盘）'}"
         )
+        stored = self._persisted_state(key)
+        if stored is not None and stored != enabled:
+            logger.warning(
+                f"[kw_recall] 配置未落盘：{SWITCH_LABELS[key]} 内存={enabled} 文件={stored}"
+            )
+        suffix = "" if saved else "（保存失败，重启后可能复原）"
         keys = TYPE_KEYS if key in TYPE_KEYS else ("notify", "notify_at")
         return (
             f"{SWITCH_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
@@ -670,9 +790,9 @@ class MessageRecall(Star):
     # 消息监听
     # ------------------------------------------------------------------
 
-    if _BUTTON_FILTER is not None:
+    if BUTTON_REGISTRAR is not None:
 
-        @_BUTTON_FILTER()
+        @BUTTON_REGISTRAR()
         @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
         async def on_button_click(self, event: AstrMessageEvent):
             """按钮点击入口。
@@ -683,7 +803,11 @@ class MessageRecall(Star):
             """
             key = self._interaction_key(event)
             if not key:
+                logger.debug(
+                    f"[kw_recall] 按钮点击未认领：{self._describe_interaction(event)}"
+                )
                 return
+            logger.info(f"[kw_recall] 按钮点击 → {SWITCH_LABELS[key]}")
             yield event.plain_result(await self._apply_toggle(key))
             event.stop_event()
 
@@ -694,7 +818,7 @@ class MessageRecall(Star):
         # 按钮点击是另一条链路（on_button_click），这里只管文字消息。
         # 老版本 AstrBot 没有 ButtonActionFilter 时，点击事件会落到这里，兜一下。
         text = event.message_str or ""
-        if _BUTTON_FILTER is None and not text.strip():
+        if BUTTON_REGISTRAR is None and not text.strip():
             key = self._interaction_key(event)
             if key:
                 yield event.plain_result(await self._apply_toggle(key))
