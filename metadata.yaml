@@ -1,8 +1,8 @@
 name: astrbot_plugin_kw_recall
 display_name: 消息撤回
 short_desc: 关键词、号码、链接、二维码、Emoji 命中自动撤回，开关与文案在插件配置页设置
-desc: 面向 QQ 官方机器人适配器的消息撤回插件。群消息命中关键词、5 位及以上连续数字、链接、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类默认全部开启，可在插件设置页逐类开关、各配一条提示文案，群里发「菜单」还能用按钮面板快速切换（仅群主/管理员可点）；不含任何聊天指令。
-version: 1.9.0
+desc: 面向 QQ 官方机器人适配器的消息撤回插件。群消息命中关键词、5 位及以上连续数字、链接、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类默认全部开启，可在插件设置页逐类开关、各配一条提示文案，群里发「菜单」还能用按钮面板快速切换（按钮仅群主/管理员可点，谁都能发「菜单」调出来）；不含任何聊天指令。
+version: 1.9.1
 author: 小雨季
 repo: https://github.com/Nxxx-x/astrbot_plugin_kw_recall
 support_platforms:

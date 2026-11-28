@@ -579,10 +579,10 @@ class MessageRecall(Star):
 
         text = event.message_str or ""
 
-        # 2. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉
+        # 2. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
+        # 谁能发都行，面板照发；点不点得动由平台按 permission.type=2 判角色。
         if text.strip() == MENU_WORD:
-            if self._is_group_admin(event):
-                yield event.chain_result(self._menu_chain())
+            yield event.chain_result(self._menu_chain())
             event.stop_event()
             return
 
