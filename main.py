@@ -44,6 +44,10 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
+# 新版 AstrBot 只把按钮事件派给带 ButtonActionFilter 的 handler，老版本没这个
+# 过滤器、按钮事件会走普通消息监听。两种都接上，按版本二选一。
+_BUTTON_FILTER = getattr(filter, "button_action", None)
+
 MAX_KEYWORDS = 200
 MAX_KEYWORD_LEN = 50
 MAX_REPLY_LEN = 200
@@ -425,6 +429,10 @@ class MessageRecall(Star):
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
         suffix = "" if saved else "（保存失败，重启后可能复原）"
+        logger.info(
+            f"[kw_recall] 面板切换 {SWITCH_LABELS[key]} → "
+            f"{'开' if enabled else '关'}{'' if saved else '（未落盘）'}"
+        )
         keys = TYPE_KEYS if key in TYPE_KEYS else ("notify", "notify_at")
         return (
             f"{SWITCH_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
@@ -662,24 +670,38 @@ class MessageRecall(Star):
     # 消息监听
     # ------------------------------------------------------------------
 
+    if _BUTTON_FILTER is not None:
+
+        @_BUTTON_FILTER()
+        @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
+        async def on_button_click(self, event: AstrMessageEvent):
+            """按钮点击入口。
+
+            AstrBot 的唤醒检查里有一道硬规则：按钮事件只会派给带 ButtonActionFilter
+            的 handler，普通 event_message_type 监听收不到点击。所以点击单独注册在
+            这里，按按钮 id 前缀认领，别人的按钮原样放行。
+            """
+            key = self._interaction_key(event)
+            if not key:
+                return
+            yield event.plain_result(await self._apply_toggle(key))
+            event.stop_event()
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群消息入口：菜单、按钮点击、五类规则。"""
-        # 1. 按钮点击：message_str 是空的，消息体是 ButtonInteraction 组件
-        key = (
-            self._interaction_key(event)
-            if not (event.message_str or "").strip()
-            else ""
-        )
-        if key:
-            yield event.plain_result(await self._apply_toggle(key))
-            event.stop_event()
-            return
-
+        """群消息入口：菜单、五类规则。"""
+        # 按钮点击是另一条链路（on_button_click），这里只管文字消息。
+        # 老版本 AstrBot 没有 ButtonActionFilter 时，点击事件会落到这里，兜一下。
         text = event.message_str or ""
+        if _BUTTON_FILTER is None and not text.strip():
+            key = self._interaction_key(event)
+            if key:
+                yield event.plain_result(await self._apply_toggle(key))
+                event.stop_event()
+                return
 
-        # 2. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
+        # 1. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
         # 谁能发都行，面板照发；点不点得动由按钮的 permission.type=1 决定。
         if text.strip() == MENU_WORD:
             if not await self._send_menu(event):
@@ -688,7 +710,7 @@ class MessageRecall(Star):
             event.stop_event()
             return
 
-        # 3. 五类规则
+        # 2. 五类规则
         active = self._active_types()
         if not active:
             return
