@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.11.3"
+PLUGIN_VERSION = "1.11.4"
 
 
 def _resolve_button_registrar():
@@ -128,7 +128,10 @@ FEEDBACK_LABELS = {
 SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-# 面板正文不放字：按钮上已经写着「撤回关键词 开」，再写标题纯属重复。
+# 面板正文的一句说明：按钮上已经写着「撤回关键词 开」，正文只负责告诉人怎么用，
+# 所以一句话就够，既不空着（空着浪费一块白），也不复述按钮上的开关状态。
+MENU_HINT = "点击下方开关按钮"
+NOTIFY_HINT = "点击下方开关按钮，切换撤回提示"
 # 官机没有纯按钮消息，正文总得给点什么；但不能给空串——空串会被平台收下、
 # 同时把 keyboard 丢掉，群里就只剩一个空白气泡。零宽空格是唯一安全的下限。
 EMPTY_TEXT = "\u200b"
@@ -368,11 +371,11 @@ class MessageRecall(Star):
         msg_id = getattr(event.message_obj, "message_id", "") or ""
         keyboard = {"content": {"rows": rows}}
 
-        if text.strip(EMPTY_TEXT):
-            # 有真文字时按老顺序：markdown 观感更好，被拒再退纯文本
-            variants = ((True, text), (False, text))
-        else:
-            variants = ((True, EMPTY_TEXT), (False, EMPTY_TEXT))
+        # 正文为空时补一个零宽空格，绝不让空串上桌（见上面的注释）
+        if not text.strip():
+            text = EMPTY_TEXT
+        # markdown 观感更好，被拒再退纯文本
+        variants = ((True, text), (False, text))
 
         last: Exception | None = None
         for with_md, content in variants:
@@ -401,14 +404,17 @@ class MessageRecall(Star):
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
         """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。
 
-        正文一律不放文字，状态全在按钮的 label 上；两条消息靠按钮内容区分，
-        第一条是五类规则，第二条是两个提示开关。
+        正文各给一句说明，告诉人「点这里」；状态全在按钮的 label 上。两条消息
+        靠正文和按钮内容区分：第一条是五类规则，第二条是两个提示开关。
         """
-        pages = (TYPE_KEYS, ("notify", "notify_at"))
+        pages = (
+            (MENU_HINT, TYPE_KEYS),
+            (NOTIFY_HINT, ("notify", "notify_at")),
+        )
         sent = False
-        for keys in pages:
+        for hint, keys in pages:
             rows = self._keyboard_rows(keys, self._switch_on)
-            sent = await self._send_keyboard(event, EMPTY_TEXT, rows) or sent
+            sent = await self._send_keyboard(event, hint, rows) or sent
         return sent
 
     def _toggle_flag(self, key: str) -> bool:
