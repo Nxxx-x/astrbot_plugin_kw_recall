@@ -1,6 +1,6 @@
 """消息撤回 · 面向 QQ 官方机器人适配器（qq_official / qq_official_webhook）。
 
-支持五类命中：关键词、5 位及以上连续数字、链接、二维码图片、Emoji，五类默认全部
+支持五类命中：违禁词、链接、5 位及以上连续数字、二维码图片、Emoji，五类默认全部
 开启，命中后调用官方 DELETE 接口撤回。
 
 配置全部在 _conf_schema.json，到 AstrBot 管理面板 → 插件 → 本插件 → 配置里改，
@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.11.5"
+PLUGIN_VERSION = "1.12.0"
 
 
 def _resolve_button_registrar():
@@ -97,40 +97,38 @@ LINK_RE = re.compile(
     re.IGNORECASE,
 )
 
-TYPE_KEYS = ("keyword", "number", "link", "qrcode", "emoji")
-# 面板上的全部开关：五类规则 + 两个提示开关
-SWITCH_KEYS = TYPE_KEYS + ("notify", "notify_at")
-# 按钮文案：一行一个按钮，字要短但要看得懂。带「撤回」前缀是为了让人一眼看出
-# 这一屏幕管的是撤回，而不是群规或别的开关。
-# QQ 按钮文案上限 10 字，最长的一项是「撤回提示艾特人 开」（9 字），留有余量。
-# 按钮上不用半角 @：手机上又小又容易看成别的符号，统一写成中文「艾特」。
+# 面板与降级文本里的排列顺序：五类规则 + 一个提示开关。
+# 注意这只是展示顺序，文本匹配的先后在 _match_text 里另有一套。
+TYPE_KEYS = ("keyword", "link", "number", "qrcode", "emoji")
+# 面板上的全部开关：五类规则 + 撤回提示。
+# 提示只有开/关两种状态，开着就一定艾特发送者，不再单列「艾特」开关。
+SWITCH_KEYS = TYPE_KEYS + ("notify",)
+# 按钮文案。一行两个按钮时每个只有半屏宽，所以六项都压到 4 个字
+# （「撤」或「撤回」+ 类型名），加「 开/关」正好 5 个字位，一列放得下。
 SWITCH_LABELS = {
-    "keyword": "撤回关键词",
-    "number": "撤回连续数字",
+    "keyword": "撤违禁词",
     "link": "撤回链接",
-    "qrcode": "撤回二维码",
-    "emoji": "撤回emoji",
+    "number": "撤回号码",
+    "qrcode": "撤二维码",
+    "emoji": "撤回表情",
     "notify": "撤回提示",
-    "notify_at": "撤回提示艾特人",
 }
-# 点击后的反馈文案：把「撤回」挪到后面，读起来像一句结论（关键词撤回 关），
-# 和按钮上的「撤回关键词 开」区分开，不至于看起来像同一句话。
+# 点击后的反馈：把「撤回」挪到后面，读起来像一句结论（违禁词撤回 关），
+# 和按钮上的「撤违禁词 开」区分开，不至于看起来像同一句话。
 FEEDBACK_LABELS = {
-    "keyword": "关键词撤回",
-    "number": "连续数字撤回",
+    "keyword": "违禁词撤回",
     "link": "链接撤回",
+    "number": "号码撤回",
     "qrcode": "二维码撤回",
-    "emoji": "emoji撤回",
+    "emoji": "表情撤回",
     "notify": "撤回提示",
-    "notify_at": "提示艾特人",
 }
-# QQ 键盘最多 5 行、每行最多 5 个按钮；这里一行放一个按钮，所以一条键盘最多 5 个开关
-SWITCHES_PER_KEYBOARD = 5
+# QQ 键盘一条最多 5 行。6 个开关按一行两个排，正好三行、一条消息发完。
+BUTTONS_PER_ROW = 2
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-# 面板正文的一句说明：按钮上已经写着「撤回关键词 开」，正文只负责告诉人怎么用，
-# 所以一句话就够，既不空着（空着浪费一块白），也不复述按钮上的开关状态。
-MENU_HINT = "点击下方开关按钮"
+# 面板正文：一句英文，和中文按钮搭在一起有点仪表盘的感觉。
+MENU_HINT = "RECALL SETTINGS"
 # 官机没有纯按钮消息，正文总得给点什么；但不能给空串——空串会被平台收下、
 # 同时把 keyboard 丢掉，群里就只剩一个空白气泡。零宽空格是唯一安全的下限。
 EMPTY_TEXT = "\u200b"
@@ -139,7 +137,7 @@ BUTTON_ID_PREFIX = "kwrecall_"
 # AstrBot 自己下发键盘时写死 2（所有人可点），这里自己拼 keyboard 用 1。
 PERMISSION_ADMIN_ONLY = 1
 DEFAULT_REPLIES = {
-    "keyword": "消息含有关键词，已撤回",
+    "keyword": "消息含有违禁词，已撤回",
     "number": "请勿发送号码，已撤回",
     "link": "请勿发送链接，已撤回",
     "qrcode": "请勿发送二维码，已撤回",
@@ -156,12 +154,12 @@ DEFAULT_ENABLED = {
 
 # QQ 官机的原生表情（含超级表情、收藏的表情包）不以 Unicode 字符下发，
 # 适配器会把 <faceType=4,...> 转成 [表情:描述] 或 [表情]。这类属于 QQ 自带
-# 表情，不纳入 emoji 撤回；匹配前统一剥掉，免得标签里的描述文字干扰关键词。
+# 表情，不纳入 emoji 撤回；匹配前统一剥掉，免得标签里的描述文字干扰违禁词。
 FACE_TAG_RE = re.compile(r"\[表情(?::[^\]]*)?\]")
 
 # 官机的 @ 同样以标签形式留在文本里（适配器只会提前剥掉 @ 机器人自己的标记）：
 #   <qqbot-at-user id="openid" />   <@!openid>   <@openid>
-# openid 常带一长串数字，不剥掉会被号码规则误判成号码；里面的字母也会误命中关键词。
+# openid 常带一长串数字，不剥掉会被号码规则误判成号码；里面的字母也会误命中违禁词。
 AT_TAG_RE = re.compile(r"<qqbot-at-user\b[^>]*>|<@!?[^>]*>", re.IGNORECASE)
 
 
@@ -263,6 +261,11 @@ class MessageRecall(Star):
         self._kw_pairs: list[tuple[str, str]] = []
         # 命令入口与文本入口可能命同一条消息，用 message_id 去重，别弹两套面板
         self._menu_msg_id = ""
+        # 老版本有独立的「提示艾特人」开关，现在并入「撤回提示」：提示开着就艾特。
+        # 这里只清内存里的残留键，不主动写盘，等下次保存时自然从文件里消失。
+        if "notify_at" in self.config:
+            self.config.pop("notify_at", None)
+            logger.info("[kw_recall] 旧配置 notify_at 已并入「撤回提示」")
         logger.info(
             f"[kw_recall] v{PLUGIN_VERSION} 已加载，按钮入口："
             f"{'button_action' if BUTTON_REGISTRAR is not None else '普通监听（老版本兜底）'}"
@@ -278,9 +281,6 @@ class MessageRecall(Star):
 
     def _notify(self) -> bool:
         return bool(self.config.get("notify", True))
-
-    def _notify_at(self) -> bool:
-        return bool(self.config.get("notify_at", True))
 
     def _on(self, key: str) -> bool:
         raw = self._group(key).get("enabled", DEFAULT_ENABLED[key])
@@ -309,15 +309,13 @@ class MessageRecall(Star):
     # ------------------------------------------------------------------
 
     def _switch_on(self, key: str) -> bool:
-        """取某个开关的当前状态，五类规则和两个提示项统一走这里。"""
+        """取某个开关的当前状态：五类规则看分组里的 enabled，提示项看顶层布尔。"""
         if key in TYPE_KEYS:
             return self._on(key)
-        if key == "notify":
-            return self._notify()
-        return self._notify_at()
+        return self._notify()
 
     def _switch_line(self, keys: tuple[str, ...]) -> str:
-        """一行显示这些开关的状态，如「撤回关键词 开 · 撤回链接 关 · …」。"""
+        """一行显示这些开关的状态，如「撤违禁词 开 · 撤回链接 关 · …」。"""
         return " · ".join(
             f"{SWITCH_LABELS[key]} {'开' if self._switch_on(key) else '关'}"
             for key in keys
@@ -325,31 +323,31 @@ class MessageRecall(Star):
 
     @staticmethod
     def _keyboard_rows(keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
-        """一行一个按钮，开=蓝(1)、关=灰(0)；permission 用 1=仅管理者可操作。"""
-        rows: list[dict[str, Any]] = []
+        """一行两个按钮，开=蓝(1)、关=灰(0)；permission 用 1=仅管理者可操作。"""
+        buttons: list[dict[str, Any]] = []
         for key in keys:
             on = on_of(key)
             label = f"{SWITCH_LABELS[key]} {'开' if on else '关'}"
-            rows.append(
+            buttons.append(
                 {
-                    "buttons": [
-                        {
-                            "id": f"{BUTTON_ID_PREFIX}{key}",
-                            "render_data": {
-                                "label": label,
-                                "visited_label": label,
-                                "style": 1 if on else 0,
-                            },
-                            "action": {
-                                "type": 1,  # 回调按钮，点了会推 INTERACTION_CREATE
-                                "permission": {"type": PERMISSION_ADMIN_ONLY},
-                                "data": f"{BUTTON_ID_PREFIX}{key}",
-                            },
-                        }
-                    ]
+                    "id": f"{BUTTON_ID_PREFIX}{key}",
+                    "render_data": {
+                        "label": label,
+                        "visited_label": label,
+                        "style": 1 if on else 0,
+                    },
+                    "action": {
+                        "type": 1,  # 回调按钮，点了会推 INTERACTION_CREATE
+                        "permission": {"type": PERMISSION_ADMIN_ONLY},
+                        "data": f"{BUTTON_ID_PREFIX}{key}",
+                    },
                 }
             )
-        return rows
+        # 一行两个；6 个开关正好三行，一条键盘发得下
+        return [
+            {"buttons": buttons[i : i + BUTTONS_PER_ROW]}
+            for i in range(0, len(buttons), BUTTONS_PER_ROW)
+        ]
 
     async def _send_keyboard(
         self, event: AstrMessageEvent, text: str, rows: list[dict[str, Any]]
@@ -403,16 +401,12 @@ class MessageRecall(Star):
         return False
 
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
-        """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。
+        """发开关面板：6 个开关、一行两个，三行一条消息发完。
 
-        两条消息正文都是「点击下方开关按钮」，靠按钮内容区分：第一条是五类规则，
-        第二条是两个提示开关；开关状态全在按钮的 label 上。
+        正文只有一句 RECALL SETTINGS，开关状态全在按钮 label 上。
         """
-        sent = False
-        for keys in (TYPE_KEYS, ("notify", "notify_at")):
-            rows = self._keyboard_rows(keys, self._switch_on)
-            sent = await self._send_keyboard(event, MENU_HINT, rows) or sent
-        return sent
+        rows = self._keyboard_rows(SWITCH_KEYS, self._switch_on)
+        return await self._send_keyboard(event, MENU_HINT, rows)
 
     def _claim_menu(self, event: AstrMessageEvent) -> bool:
         """同一条消息只弹一次面板。
@@ -433,11 +427,7 @@ class MessageRecall(Star):
         if not self._claim_menu(event):
             return
         if not await self._send_menu(event):
-            lines = (
-                self._switch_line(TYPE_KEYS),
-                self._switch_line(("notify", "notify_at")),
-            )
-            yield event.plain_result("\n".join(lines))
+            yield event.plain_result(self._switch_line(SWITCH_KEYS))
 
     def _toggle_flag(self, key: str) -> bool:
         """翻转一个开关并返回新状态；配置里缺字段时补出来。"""
@@ -583,7 +573,7 @@ class MessageRecall(Star):
     async def _apply_toggle(self, key: str) -> str | None:
         """切换开关并落盘，返回要回到群里的那句反馈。
 
-        成功时回一句最短的结论，如「关键词撤回 关」——按钮是旧状态，点完不
+        成功时回一句最短的结论，如「违禁词撤回 关」——按钮是旧状态，点完不
         给回执，用户不知道有没有生效；一行文字的成本比让人再发一次「菜单」
         低得多。真的没写进配置时换成更明确的提示。
         """
@@ -607,7 +597,7 @@ class MessageRecall(Star):
     # ------------------------------------------------------------------
 
     def _match_text(self, text: str) -> tuple[str, str] | None:
-        """按 关键词 → 链接 → 号码 → emoji 的顺序匹配，返回 (类型, 命中说明)。"""
+        """按 违禁词 → 链接 → 号码 → emoji 的顺序匹配，返回 (类型, 命中说明)。"""
         # QQ 原生表情是 [表情:描述] 标签、@ 是 <qqbot-at-user id="…"/> 标签，
         # 两者都不是用户打的字：标签里的描述文字和 openid 不能当正文参与匹配，
         # 否则「[表情:笑哭]」会被「笑」误命中、@ 别人的 openid 会被当成号码。
@@ -617,7 +607,7 @@ class MessageRecall(Star):
             lowered = text.lower()
             for word, lowered_word in self._keyword_pairs():
                 if lowered_word in lowered:
-                    return "keyword", f"关键词「{word}」"
+                    return "keyword", f"违禁词「{word}」"
 
         if self._on("link"):
             found = LINK_RE.search(text)
@@ -889,7 +879,7 @@ class MessageRecall(Star):
                 event.stop_event()
                 return
 
-        # 1. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
+        # 1. 菜单：先于规则判断，免得「菜单」两个字被违禁词规则顺手撤掉。
         # 谁能发都行，面板照发；点不点得动由按钮的 permission.type=1 决定。
         # 裸发「菜单」走这里；带唤醒前缀的（如 /菜单）会先命中 cmd_menu 命令入口，
         # 两边都认领同一条消息，靠 message_id 去重，不会弹两次。
@@ -904,7 +894,7 @@ class MessageRecall(Star):
         if not active:
             return
         if active == ["keyword"] and not self._keyword_pairs():
-            # 只剩关键词但词表是空的，没什么可匹配
+            # 只剩违禁词但词表是空的，没什么可匹配
             return
 
         hit = self._match_text(text) if text.strip() else None
@@ -937,7 +927,8 @@ class MessageRecall(Star):
         reply_text = self._reply(hit_type)
         if self._notify() and reply_text:
             sender_id = event.get_sender_id()
-            if self._notify_at() and sender_id:
+            # 提示开着就一定艾特；真拿不到发送者 ID 时才退回纯文本。
+            if sender_id:
                 # 官机会把 At 转成 <qqbot-at-user id="openid" /> 内联进文本，
                 # openid 正好就是发送者 ID。
                 yield event.chain_result(

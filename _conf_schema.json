@@ -1,28 +1,22 @@
 {
   "notify": {
-    "description": "撤回后发送提示",
+    "description": "撤回后发提示并艾特发送者",
     "type": "bool",
     "default": true,
-    "hint": "关闭则只撤回、不发言；五类各自的提示文案见下方分组"
-  },
-  "notify_at": {
-    "description": "提示时艾特被撤回的人",
-    "type": "bool",
-    "default": true,
-    "hint": "需要先开启「撤回后发送提示」。官机会把它渲染成蓝字 @ 昵称；不想艾特人就关掉"
+    "hint": "关闭则只撤回、不发言；开着时提示会艾特被撤回的人。五类各自的提示文案见下方分组"
   },
   "keyword": {
-    "description": "关键词撤回",
+    "description": "违禁词撤回",
     "type": "object",
-    "hint": "消息包含任一关键词就撤回，不区分英文大小写",
+    "hint": "消息包含任一违禁词就撤回，不区分英文大小写",
     "items": {
       "enabled": {
-        "description": "启用关键词撤回",
+        "description": "启用违禁词撤回",
         "type": "bool",
         "default": true
       },
       "list": {
-        "description": "关键词列表",
+        "description": "违禁词列表",
         "type": "text",
         "default": "",
         "hint": "一行一个，最多 200 个，每个最长 50 字。建议每个词 2 字以上，太短容易误撤"
@@ -30,25 +24,7 @@
       "reply": {
         "description": "提示文案",
         "type": "string",
-        "default": "消息含有关键词，已撤回",
-        "hint": "留空表示这一类撤回后不发言"
-      }
-    }
-  },
-  "number": {
-    "description": "号码撤回",
-    "type": "object",
-    "hint": "连续 5 位及以上数字视为号码，如 12345、88888；123 45 中间断开不算",
-    "items": {
-      "enabled": {
-        "description": "启用号码撤回",
-        "type": "bool",
-        "default": true
-      },
-      "reply": {
-        "description": "提示文案",
-        "type": "string",
-        "default": "请勿发送号码，已撤回",
+        "default": "消息含有违禁词，已撤回",
         "hint": "留空表示这一类撤回后不发言"
       }
     }
@@ -67,6 +43,24 @@
         "description": "提示文案",
         "type": "string",
         "default": "请勿发送链接，已撤回",
+        "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "number": {
+    "description": "号码撤回",
+    "type": "object",
+    "hint": "连续 5 位及以上数字视为号码，如 12345、88888；123 45 中间断开不算",
+    "items": {
+      "enabled": {
+        "description": "启用号码撤回",
+        "type": "bool",
+        "default": true
+      },
+      "reply": {
+        "description": "提示文案",
+        "type": "string",
+        "default": "请勿发送号码，已撤回",
         "hint": "留空表示这一类撤回后不发言"
       }
     }
