@@ -116,8 +116,9 @@ SWITCH_LABELS = {
 SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-MENU_TITLE = f"撤回开关 · v{PLUGIN_VERSION} · 点按钮切换（仅群主/管理员可点）"
-NOTIFY_TITLE = "提示设置 · 点按钮切换（仅群主/管理员可点）"
+# 面板正文能省则省：按钮上已经写着「关键词 开」，正文只留一个词做区分
+MENU_TITLE = "撤回"
+NOTIFY_TITLE = "提示"
 BUTTON_ID_PREFIX = "kwrecall_"
 # 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
 # AstrBot 自己下发键盘时写死 2（所有人可点），这里自己拼 keyboard 用 1。
@@ -305,9 +306,6 @@ class MessageRecall(Star):
             for key in keys
         )
 
-    def _status_line(self) -> str:
-        return self._switch_line(TYPE_KEYS)
-
     @staticmethod
     def _keyboard_rows(keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
         """一行一个按钮，开=蓝(1)、关=灰(0)；permission 用 1=仅管理者可操作。"""
@@ -386,16 +384,18 @@ class MessageRecall(Star):
         return False
 
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
-        """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。"""
+        """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。
+
+        正文只有一个词——按钮自己写着「关键词 开」，不需要再复述一遍状态。
+        """
         pages = (
             (MENU_TITLE, TYPE_KEYS),
             (NOTIFY_TITLE, ("notify", "notify_at")),
         )
         sent = False
         for title, keys in pages:
-            text = f"{title}\n{self._switch_line(keys)}"
             rows = self._keyboard_rows(keys, self._switch_on)
-            sent = await self._send_keyboard(event, text, rows) or sent
+            sent = await self._send_keyboard(event, title, rows) or sent
         return sent
 
     def _toggle_flag(self, key: str) -> bool:
@@ -539,8 +539,12 @@ class MessageRecall(Star):
             return None
         return bool(data[key])
 
-    async def _apply_toggle(self, key: str) -> str:
-        """切换开关、写回配置，返回给群里的那行提示。"""
+    async def _apply_toggle(self, key: str) -> str | None:
+        """切换开关并落盘。
+
+        按钮上已经写着新状态，成功就不发言了，只写日志；只有真的没写进配置
+        时才回一句话，避免刷屏。
+        """
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
         logger.info(
@@ -552,12 +556,9 @@ class MessageRecall(Star):
             logger.warning(
                 f"[kw_recall] 配置未落盘：{SWITCH_LABELS[key]} 内存={enabled} 文件={stored}"
             )
-        suffix = "" if saved else "（保存失败，重启后可能复原）"
-        keys = TYPE_KEYS if key in TYPE_KEYS else ("notify", "notify_at")
-        return (
-            f"{SWITCH_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
-            f"{self._switch_line(keys)}"
-        )
+        if saved and (stored is None or stored == enabled):
+            return None
+        return "保存失败，请到面板改"
 
     # ------------------------------------------------------------------
     # 匹配
@@ -808,7 +809,9 @@ class MessageRecall(Star):
                 )
                 return
             logger.info(f"[kw_recall] 按钮点击 → {SWITCH_LABELS[key]}")
-            yield event.plain_result(await self._apply_toggle(key))
+            reply = await self._apply_toggle(key)
+            if reply:
+                yield event.plain_result(reply)
             event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -821,7 +824,9 @@ class MessageRecall(Star):
         if BUTTON_REGISTRAR is None and not text.strip():
             key = self._interaction_key(event)
             if key:
-                yield event.plain_result(await self._apply_toggle(key))
+                reply = await self._apply_toggle(key)
+                if reply:
+                    yield event.plain_result(reply)
                 event.stop_event()
                 return
 
@@ -830,7 +835,7 @@ class MessageRecall(Star):
         if text.strip() == MENU_WORD:
             if not await self._send_menu(event):
                 # 发不出带按钮的消息（老版本/接口拒绝）时退成一条纯文本状态
-                yield event.plain_result(f"{MENU_TITLE}\n{self._status_line()}")
+                yield event.plain_result(f"撤回开关\n{self._switch_line(SWITCH_KEYS)}")
             event.stop_event()
             return
 
