@@ -4,8 +4,8 @@
 开启，命中后调用官方 DELETE 接口撤回。
 
 配置全部在 _conf_schema.json，到 AstrBot 管理面板 → 插件 → 本插件 → 配置里改，
-保存即生效（插件读的就是同一份 config 对象）。插件不注册任何聊天指令，群里发
-/撤回xx 之类不会被拦截。
+保存即生效（插件读的就是同一份 config 对象）。群内只认一个入口词「菜单」，其余
+文本一概不拦截，群里发 /撤回xx 之类不会被响应。
 
 官机撤回的三个前提，写死在 README 里，代码这边只做兜底：
 1. 只能撤回 2 分钟内发送的消息，超时返回 40064004；
@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.10.0"
+PLUGIN_VERSION = "1.11.1"
 
 
 def _resolve_button_registrar():
@@ -98,17 +98,28 @@ LINK_RE = re.compile(
 )
 
 TYPE_KEYS = ("keyword", "number", "link", "qrcode", "emoji")
-TYPE_LABELS = {
-    "keyword": "关键词",
-    "number": "号码",
-    "link": "链接",
-    "qrcode": "二维码",
-    "emoji": "表情",
-}
 # 面板上的全部开关：五类规则 + 两个提示开关
 SWITCH_KEYS = TYPE_KEYS + ("notify", "notify_at")
+# 按钮文案：一行一个按钮，字要短但要看得懂。带「撤回」前缀是为了让人一眼看出
+# 这一屏幕管的是撤回，而不是群规或别的开关。
+# QQ 按钮文案上限 10 字，最长的一项是「撤回连续数字 开」（8 字），留有余量。
 SWITCH_LABELS = {
-    **TYPE_LABELS,
+    "keyword": "撤回关键词",
+    "number": "撤回连续数字",
+    "link": "撤回链接",
+    "qrcode": "撤回二维码",
+    "emoji": "撤回emoji",
+    "notify": "撤回提示",
+    "notify_at": "撤回提示@人",
+}
+# 点击后的反馈文案：把「撤回」挪到后面，读起来像一句结论（关键词撤回 关），
+# 和按钮上的「撤回关键词 开」区分开，不至于看起来像同一句话。
+FEEDBACK_LABELS = {
+    "keyword": "关键词撤回",
+    "number": "连续数字撤回",
+    "link": "链接撤回",
+    "qrcode": "二维码撤回",
+    "emoji": "emoji撤回",
     "notify": "撤回提示",
     "notify_at": "提示@人",
 }
@@ -116,9 +127,9 @@ SWITCH_LABELS = {
 SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-# 面板正文能省则省：按钮上已经写着「关键词 开」，正文只留一个词做区分
-MENU_TITLE = "撤回"
-NOTIFY_TITLE = "提示"
+# 面板正文不放字：按钮上已经写着「撤回关键词 开」，再写标题纯属重复。
+# 部分接口不接受空 content，用零宽空格占位，视觉上就是没有文字。
+EMPTY_TEXT = "\u200b"
 BUTTON_ID_PREFIX = "kwrecall_"
 # 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
 # AstrBot 自己下发键盘时写死 2（所有人可点），这里自己拼 keyboard 用 1。
@@ -300,7 +311,7 @@ class MessageRecall(Star):
         return self._notify_at()
 
     def _switch_line(self, keys: tuple[str, ...]) -> str:
-        """一行显示这些开关的状态，如「关键词 开 · 号码 关 · …」。"""
+        """一行显示这些开关的状态，如「撤回关键词 开 · 撤回链接 关 · …」。"""
         return " · ".join(
             f"{SWITCH_LABELS[key]} {'开' if self._switch_on(key) else '关'}"
             for key in keys
@@ -386,16 +397,14 @@ class MessageRecall(Star):
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
         """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。
 
-        正文只有一个词——按钮自己写着「关键词 开」，不需要再复述一遍状态。
+        正文一律不放文字，状态全在按钮的 label 上；两条消息靠按钮内容区分，
+        第一条是五类规则，第二条是两个提示开关。
         """
-        pages = (
-            (MENU_TITLE, TYPE_KEYS),
-            (NOTIFY_TITLE, ("notify", "notify_at")),
-        )
+        pages = (TYPE_KEYS, ("notify", "notify_at"))
         sent = False
-        for title, keys in pages:
+        for keys in pages:
             rows = self._keyboard_rows(keys, self._switch_on)
-            sent = await self._send_keyboard(event, title, rows) or sent
+            sent = await self._send_keyboard(event, EMPTY_TEXT, rows) or sent
         return sent
 
     def _toggle_flag(self, key: str) -> bool:
@@ -540,10 +549,11 @@ class MessageRecall(Star):
         return bool(data[key])
 
     async def _apply_toggle(self, key: str) -> str | None:
-        """切换开关并落盘。
+        """切换开关并落盘，返回要回到群里的那句反馈。
 
-        按钮上已经写着新状态，成功就不发言了，只写日志；只有真的没写进配置
-        时才回一句话，避免刷屏。
+        成功时回一句最短的结论，如「关键词撤回 关」——按钮是旧状态，点完不
+        给回执，用户不知道有没有生效；一行文字的成本比让人再发一次「菜单」
+        低得多。真的没写进配置时换成更明确的提示。
         """
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
@@ -557,7 +567,7 @@ class MessageRecall(Star):
                 f"[kw_recall] 配置未落盘：{SWITCH_LABELS[key]} 内存={enabled} 文件={stored}"
             )
         if saved and (stored is None or stored == enabled):
-            return None
+            return f"{FEEDBACK_LABELS[key]} {'开' if enabled else '关'}"
         return "保存失败，请到面板改"
 
     # ------------------------------------------------------------------
@@ -834,8 +844,12 @@ class MessageRecall(Star):
         # 谁能发都行，面板照发；点不点得动由按钮的 permission.type=1 决定。
         if text.strip() == MENU_WORD:
             if not await self._send_menu(event):
-                # 发不出带按钮的消息（老版本/接口拒绝）时退成一条纯文本状态
-                yield event.plain_result(f"撤回开关\n{self._switch_line(SWITCH_KEYS)}")
+                # 发不出带按钮的消息（老版本/接口拒绝）时退成纯文本状态
+                lines = (
+                    self._switch_line(TYPE_KEYS),
+                    self._switch_line(("notify", "notify_at")),
+                )
+                yield event.plain_result("\n".join(lines))
             event.stop_event()
             return
 
