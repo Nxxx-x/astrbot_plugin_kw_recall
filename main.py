@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.13.0"
+PLUGIN_VERSION = "1.13.1"
 
 
 def _resolve_button_registrar():
@@ -113,16 +113,9 @@ SWITCH_LABELS = {
     "emoji": "撤回表情",
     "notify": "撤回提示",
 }
-# 点击后的反馈：把「撤回」挪到后面，读起来像一句结论（违禁词撤回 关），
-# 和按钮上的「撤违禁词 开」区分开，不至于看起来像同一句话。
-FEEDBACK_LABELS = {
-    "keyword": "违禁词撤回",
-    "link": "链接撤回",
-    "number": "号码撤回",
-    "qrcode": "二维码撤回",
-    "emoji": "表情撤回",
-    "notify": "撤回提示",
-}
+# 点击后的回执：只说结果（已开 / 已关）。点的是哪个开关就在眼前，
+# 再重复一遍类型名反而是噪音；要看最新状态重发一次「菜单」。
+FEEDBACK_TEXT = {True: "已开", False: "已关"}
 # QQ 键盘一条最多 5 行。6 个开关按一行两个排，正好三行、一条消息发完。
 BUTTONS_PER_ROW = 2
 # 群里发这两个字就弹出开关面板
@@ -586,11 +579,11 @@ class MessageRecall(Star):
         return bool(data[key])
 
     async def _apply_toggle(self, key: str) -> str | None:
-        """切换开关并落盘，返回要回到群里的那句反馈。
+        """切换开关并落盘，返回要回到群里的那句回执。
 
-        成功时回一句最短的结论，如「违禁词撤回 关」——按钮是旧状态，点完不
-        给回执，用户不知道有没有生效；一行文字的成本比让人再发一次「菜单」
-        低得多。真的没写进配置时换成更明确的提示。
+        成功时只回「已开」/「已关」——点的是哪个开关就在眼前，回执只说结果，
+        不再复述开关名（已发出去的面板不会自动刷新，要看新状态重发一次「菜单」）。
+        真的没写进配置时换成更明确的提示。
         """
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
@@ -604,7 +597,7 @@ class MessageRecall(Star):
                 f"[kw_recall] 配置未落盘：{SWITCH_LABELS[key]} 内存={enabled} 文件={stored}"
             )
         if saved and (stored is None or stored == enabled):
-            return f"{FEEDBACK_LABELS[key]} {'开' if enabled else '关'}"
+            return FEEDBACK_TEXT[enabled]
         return "保存失败，请到面板改"
 
     # ------------------------------------------------------------------
