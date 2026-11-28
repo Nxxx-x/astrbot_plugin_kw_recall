@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.13.1"
+PLUGIN_VERSION = "1.13.2"
 
 
 def _resolve_button_registrar():

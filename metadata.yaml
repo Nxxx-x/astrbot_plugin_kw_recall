@@ -1,10 +1,17 @@
 name: astrbot_plugin_kw_recall
 display_name: 消息撤回
-short_desc: 违禁词、链接、号码、二维码、Emoji 命中自动撤回，开关与文案在插件配置页设置
-desc: 面向 QQ 官方机器人适配器的消息撤回插件。群消息命中违禁词、链接、5 位及以上连续数字、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类默认全部开启，可在插件设置页逐类开关、各配一条提示文案，提示会艾特发送者。群里发「菜单」弹出按钮面板快速切换（一行两个、六个开关一条消息，按钮仅群主/管理员可点），点击后回一行简短回执；面板标题可在插件设置里自定义（默认 RECALL SETTINGS），除「菜单」外不含其他聊天指令。
-version: 1.13.1
+short_desc: QQ 官方机器人群消息自动撤回：违禁词、链接、号码、二维码、Emoji 命中即撤，可在配置页逐类开关
+desc: 面向 QQ 官方机器人适配器的消息撤回插件。群消息命中违禁词、链接、5 位及以上连续数字、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类默认全部开启，可在插件设置页逐类开关、各配一条提示文案，提示会艾特发送者。群里发「菜单」弹出按钮面板快速切换（一行两个、六个开关一条消息，按钮仅群主/管理员可点），点击后只回「已开 / 已关」；面板标题可在插件设置里自定义（默认 RECALL SETTINGS），除「菜单」外不含其他聊天指令。
+version: 1.13.2
 author: 小雨季
 repo: https://github.com/Nxxx-x/astrbot_plugin_kw_recall
+social_link: https://github.com/Nxxx-x
+tags:
+  - QQ官方机器人
+  - 消息撤回
+  - 违禁词
+  - 内容审核
+  - 群管理
 support_platforms:
   - qq_official
   - qq_official_webhook

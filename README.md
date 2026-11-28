@@ -4,11 +4,13 @@
 
 全自动判定，只有一条群内入口 `菜单`（弹出按钮面板）。五类规则**默认全部开启**，装完即生效，其余设置都在 AstrBot 管理面板里。
 
-| | |
+| 项目 | 说明 |
 |---|---|
+| 插件标识 | `astrbot_plugin_kw_recall` |
+| 仓库 | [Nxxx-x/astrbot_plugin_kw_recall](https://github.com/Nxxx-x/astrbot_plugin_kw_recall) |
 | 支持平台 | `qq_official`、`qq_official_webhook` |
 | AstrBot 版本 | `>= 4.16,< 5` |
-| 当前版本 | 1.13.1 |
+| 当前版本 | 1.13.2（以 `metadata.yaml` 为准） |
 | 依赖 | `opencv-python-headless`、`regex`（均可选，缺失只影响对应功能） |
 | 许可 | MIT |
 
@@ -177,7 +179,7 @@ RECALL SETTINGS
 
 | 日志 | 含义 |
 |---|---|
-| `v1.13.1 已加载，按钮入口：button_action` | 新版本已生效，点击能派到插件 |
+| `v1.13.2 已加载，按钮入口：button_action` | 新版本已生效，点击能派到插件（版本号随插件走） |
 | `按钮点击 → 撤回链接` | 事件收到了，接着应该跟一行 `面板切换 撤回链接 → 关` |
 | 只有「已加载」、没有「按钮点击」 | 事件没派进来：确认面板是升级后重新发的（发一次 `菜单` 应回一条、六个按钮），再不行就是 AstrBot 版本太旧 |
 
@@ -233,55 +235,19 @@ ruff format . && ruff check .   # 目标版本 Python 3.10，配置见 pyproject
 
 ```text
 astrbot_plugin_kw_recall/
-├── main.py              # 插件主体（Star 子类、规则匹配、撤回调用）
-├── _conf_schema.json    # 配置项定义
-├── metadata.yaml        # 插件元数据
-├── requirements.txt     # 可选依赖
-├── pyproject.toml       # ruff 配置
+├── main.py             # 插件主体（Star 子类、规则匹配、撤回调用）
+├── _conf_schema.json   # 配置项定义
+├── metadata.yaml       # 插件元数据（版本号、支持平台、标签）
+├── requirements.txt    # 可选依赖
+├── pyproject.toml      # ruff 配置
 ├── logo.png
-└── README.md
+├── README.md           # 使用说明
+├── CHANGELOG.md        # 版本变更记录
+└── LICENSE
 ```
 
-## 更新日志
-
-| 版本 | 变化 |
-|---|---|
-| 1.13.1 | 点击回执缩成 `已开` / `已关`，不再带类型名（原「违禁词撤回 关」） |
-| 1.13.0 | 面板标题可改：新增配置项「菜单标题」（`menu_title`），仅在插件设置里修改；留空回退 `RECALL SETTINGS`，换行压成一行、最多 40 字 |
-| 1.12.0 | 面板改成一行两个按钮，6 个开关一条消息发完；「提示艾特人」并入「撤回提示」（开着即艾特）；按钮文案压到 4 字（撤违禁词 / 撤回链接 / 撤回号码 / 撤二维码 / 撤回表情 / 撤回提示），正文改成 `RECALL SETTINGS` |
-| 1.11.5 | 「菜单」注册为 AstrBot 命令（`/菜单` 同样生效），两条面板正文统一成「点击下方开关按钮」 |
-| 1.11.4 | 面板正文加回一句说明（「点击下方开关按钮」），指令小节提到文档前部并补成表格 |
-| 1.11.3 | 修复发「菜单」只回一个空白气泡：空正文会被平台吞掉 keyboard，正文固定用零宽空格 |
-| 1.11.2 | 按钮与配置里的「@」统一写成「艾特」 |
-| 1.11.1 | 面板不再带正文（纯按钮）；按钮文案补全成「撤回关键词 开」这种；点击后回一行最短回执「关键词撤回 关」；文档补「指令」一节 |
-| 1.11.0 | 面板正文缩到两个字，点击成功后不再发言（只在保存失败时提示） |
-| 1.10.0 | 按钮点击取值加三层兜底（官方取法 / 组件 / 原始 interaction），注册入口兼容两个模块路径；面板标题带版本号，启动与点击各打一条日志，落盘后回读校验 |
-| 1.9.3 | 修按钮点了没反应：点击改由 `filter.button_action` 入口处理（AstrBot 只把按钮事件派给带 `ButtonActionFilter` 的 handler）；切换写一条 info 日志 |
-| 1.9.2 | 按钮改为「仅管理者可操作」（自己下发键盘，permission.type=1）；一行一个按钮，7 个开关分两条键盘消息 |
-| 1.9.1 | 「菜单」不再校验发送者角色，任何成员都能调出面板；按钮仍只认群主/管理员 |
-| 1.9.0 | 新增群内「菜单」按钮面板，点一下开关五类规则，改动实时写回配置 |
-| 1.8.0 | 发布版说明文档、512×512 插件图标、MIT 许可证 |
-| 1.7.0 | 热路径优化（词表缓存、emoji 短路、二维码缓存与限流）、错误码分级、botpy 兼容兜底 |
-| 1.6.1 | 全部开关默认开启；Emoji 提示文案改为「请勿发送emoji，已撤回」 |
-| 1.6.0 | 去掉总开关与全部聊天指令，改为纯配置页 |
-| 1.5.0 | 去掉自带 Web 管理页，改用 `_conf_schema.json` |
-| 1.4.x | 五类规则成型（关键词 / 号码 / 链接 / 二维码 / Emoji） |
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)；发版时先把 `metadata.yaml` 的 `version` 改好，再在 CHANGELOG 里补一条同号记录。
 
 ## 许可
 
 [MIT](LICENSE) © 小雨季（GitHub: [Nxxx-x](https://github.com/Nxxx-x)）
-
----
-
-## 发布到插件市场
-
-在 [AstrBot 插件市场](https://plugins.astrbot.app) 提交时，Issue 标题用 `[Plugin] astrbot_plugin_kw_recall`，JSON 与 `metadata.yaml` 保持一致：
-
-```json
-{
-  "name": "astrbot_plugin_kw_recall",
-  "desc": "面向 QQ 官方机器人适配器的消息撤回插件。群消息命中违禁词、链接、5 位及以上连续数字、二维码图片或 Unicode Emoji 时调用官方撤回接口删除（QQ 自带表情、@ 标签不参与判断）；五类默认全部开启，可在插件设置页逐类开关、各配一条提示文案，提示会艾特发送者。群里发「菜单」弹出按钮面板快速切换（一行两个、六个开关一条消息，按钮仅群主/管理员可点），点击后回一行简短回执；面板标题可在插件设置里自定义（默认 RECALL SETTINGS），除「菜单」外不含其他聊天指令。",
-  "author": "小雨季",
-  "repo": "https://github.com/Nxxx-x/astrbot_plugin_kw_recall"
-}
-```
