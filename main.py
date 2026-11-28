@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 from collections import OrderedDict
 from typing import Any
@@ -26,13 +27,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-# 按钮面板依赖较新的 AstrBot（ActionRow / Button / ButtonInteraction）。
-# 老版本没有这几个组件时，"菜单"自动降级为纯文本状态，其余功能不受影响。
+# 按钮面板依赖较新的 AstrBot（能解析出 ButtonInteraction）。
+# 老版本没有这个组件时，"菜单"自动降级为纯文本状态，其余功能不受影响。
 try:
-    from astrbot.api.message_components import ActionRow, Button, ButtonInteraction
+    from astrbot.api.message_components import ButtonInteraction
 except Exception:  # pragma: no cover - 取决于 AstrBot 版本
-    ActionRow = None  # type: ignore[assignment]
-    Button = None  # type: ignore[assignment]
     ButtonInteraction = None  # type: ignore[assignment]
 
 try:  # 官机适配器依赖 botpy，理论上必装；缺失时插件仍可加载
@@ -73,10 +72,23 @@ TYPE_LABELS = {
     "qrcode": "二维码",
     "emoji": "表情",
 }
+# 面板上的全部开关：五类规则 + 两个提示开关
+SWITCH_KEYS = TYPE_KEYS + ("notify", "notify_at")
+SWITCH_LABELS = {
+    **TYPE_LABELS,
+    "notify": "撤回提示",
+    "notify_at": "提示@人",
+}
+# QQ 键盘最多 5 行、每行最多 5 个按钮；这里一行放一个按钮，所以一条键盘最多 5 个开关
+SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
-MENU_TEXT = "撤回开关 · 点按钮切换（仅群管理员/群主可点）"
+MENU_TITLE = "撤回开关 · 点按钮切换（仅群主/管理员可点）"
+NOTIFY_TITLE = "提示设置 · 点按钮切换（仅群主/管理员可点）"
 BUTTON_ID_PREFIX = "kwrecall_"
+# 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
+# AstrBot 自己下发键盘时写死 2（所有人可点），这里自己拼 keyboard 用 1。
+PERMISSION_ADMIN_ONLY = 1
 DEFAULT_REPLIES = {
     "keyword": "消息含有关键词，已撤回",
     "number": "请勿发送号码，已撤回",
@@ -238,44 +250,129 @@ class MessageRecall(Star):
         return [key for key in TYPE_KEYS if self._on(key)]
 
     # ------------------------------------------------------------------
-    # 开关面板（群管理员点按钮改配置）
+    # 开关面板（群主/管理员点按钮改配置）
     # ------------------------------------------------------------------
 
-    def _status_line(self) -> str:
-        """一行显示五类开关状态，如「关键词 开 · 号码 关 · …」。"""
+    def _switch_on(self, key: str) -> bool:
+        """取某个开关的当前状态，五类规则和两个提示项统一走这里。"""
+        if key in TYPE_KEYS:
+            return self._on(key)
+        if key == "notify":
+            return self._notify()
+        return self._notify_at()
+
+    def _switch_line(self, keys: tuple[str, ...]) -> str:
+        """一行显示这些开关的状态，如「关键词 开 · 号码 关 · …」。"""
         return " · ".join(
-            f"{TYPE_LABELS[key]} {'开' if self._on(key) else '关'}" for key in TYPE_KEYS
+            f"{SWITCH_LABELS[key]} {'开' if self._switch_on(key) else '关'}"
+            for key in keys
         )
 
-    def _menu_chain(self) -> list[Any]:
-        """菜单消息：一句说明 + 一排按钮，开=蓝、关=灰。"""
-        if ActionRow is None or Button is None:
-            return [Comp.Plain(f"{MENU_TEXT}\n{self._status_line()}")]
+    def _status_line(self) -> str:
+        return self._switch_line(TYPE_KEYS)
 
-        buttons = []
-        for key in TYPE_KEYS:
-            on = self._on(key)
-            buttons.append(
-                Button(
-                    id=f"{BUTTON_ID_PREFIX}{key}",
-                    label=f"{TYPE_LABELS[key]} {'开' if on else '关'}",
-                    action=Button.CallbackAction(data={"k": key}),
-                    style=Button.Style.SUCCESS if on else Button.Style.DEFAULT,
-                )
+    @staticmethod
+    def _keyboard_rows(keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
+        """一行一个按钮，开=蓝(1)、关=灰(0)；permission 用 1=仅管理者可操作。"""
+        rows: list[dict[str, Any]] = []
+        for key in keys:
+            on = on_of(key)
+            label = f"{SWITCH_LABELS[key]} {'开' if on else '关'}"
+            rows.append(
+                {
+                    "buttons": [
+                        {
+                            "id": f"{BUTTON_ID_PREFIX}{key}",
+                            "render_data": {
+                                "label": label,
+                                "visited_label": label,
+                                "style": 1 if on else 0,
+                            },
+                            "action": {
+                                "type": 1,  # 回调按钮，点了会推 INTERACTION_CREATE
+                                "permission": {"type": PERMISSION_ADMIN_ONLY},
+                                "data": f"{BUTTON_ID_PREFIX}{key}",
+                            },
+                        }
+                    ]
+                }
             )
-        return [
-            Comp.Plain(MENU_TEXT),
-            ActionRow(buttons=buttons, fallback_text=self._status_line()),
-        ]
+        return rows
+
+    async def _send_keyboard(
+        self, event: AstrMessageEvent, text: str, rows: list[dict[str, Any]]
+    ) -> bool:
+        """直接调 botpy 发带按钮的消息。
+
+        AstrBot 自己的 keyboard 序列化把 permission 写死成 2（所有人可点），
+        所以这里绕开它自己拼 payload，换成 1（仅群主/管理员可点）。
+        markdown 被平台拒绝时退到纯文本正文，按钮照发。
+        """
+        api = getattr(getattr(event, "bot", None), "api", None)
+        group_id = event.get_group_id()
+        if api is None or not group_id or not rows:
+            return False
+
+        msg_id = getattr(event.message_obj, "message_id", "") or ""
+        keyboard = {"content": {"rows": rows}}
+        base: dict[str, Any] = {
+            "group_openid": group_id,
+            "keyboard": keyboard,
+            "msg_seq": random.randint(1, 10000),
+        }
+        if msg_id:
+            base["msg_id"] = msg_id
+
+        # 依次尝试：markdown 被动回复 → markdown 主动发送 → 纯文本被动 → 纯文本主动
+        candidates: list[dict[str, Any]] = []
+        for with_md in (True, False):
+            for with_id in (True, False) if msg_id else (False,):
+                payload = dict(base)
+                if with_md:
+                    payload["msg_type"] = 2
+                    payload["markdown"] = {"content": text}
+                else:
+                    payload["msg_type"] = 0
+                    payload["content"] = text
+                if not with_id:
+                    payload.pop("msg_id", None)
+                candidates.append(payload)
+
+        last: Exception | None = None
+        for payload in candidates:
+            try:
+                await api.post_group_message(**payload)
+                return True
+            except Exception as exc:  # 换一种发法再试
+                last = exc
+        logger.warning(f"[kw_recall] 菜单发送失败：{last}")
+        return False
+
+    async def _send_menu(self, event: AstrMessageEvent) -> bool:
+        """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。"""
+        pages = (
+            (MENU_TITLE, TYPE_KEYS),
+            (NOTIFY_TITLE, ("notify", "notify_at")),
+        )
+        sent = False
+        for title, keys in pages:
+            text = f"{title}\n{self._switch_line(keys)}"
+            rows = self._keyboard_rows(keys, self._switch_on)
+            sent = await self._send_keyboard(event, text, rows) or sent
+        return sent
 
     def _toggle_flag(self, key: str) -> bool:
-        """翻转某一类开关并返回新状态；配置里缺这一组时补出来。"""
-        group = self.config.get(key)
-        if not isinstance(group, dict):
-            group = {}
-            self.config[key] = group
-        group["enabled"] = not self._on(key)
-        return group["enabled"]
+        """翻转一个开关并返回新状态；配置里缺字段时补出来。"""
+        if key in TYPE_KEYS:
+            group = self.config.get(key)
+            if not isinstance(group, dict):
+                group = {}
+                self.config[key] = group
+            group["enabled"] = not self._on(key)
+            return bool(group["enabled"])
+
+        self.config[key] = not self._switch_on(key)
+        return bool(self.config[key])
 
     async def _save_config(self) -> bool:
         """把改动写回 data/config/<plugin>_config.json。"""
@@ -292,11 +389,11 @@ class MessageRecall(Star):
 
     @staticmethod
     def _interaction_key(event: AstrMessageEvent) -> str:
-        """从按钮点击事件里取出被点的类型；不是按钮事件或参数不认识时返回空串。
+        """从按钮点击事件里取出被点的开关名；不是按钮事件或参数不认识时返回空串。
 
-        管理员身份由 QQ 平台保证：AstrBot 下发键盘时固定 permission.type=2，
-        非管理员/群主在客户端点不动，所以这里不再重复查角色（官机也没有群成员
-        角色接口）。
+        权限不在代码里判：键盘是我们自己下发的，按钮带 permission.type=1，
+        QQ 只在群主/管理员点击时才把 INTERACTION_CREATE 推过来，普通成员点了
+        客户端直接拦掉，事件根本到不了这里。
         """
         if ButtonInteraction is None:
             return ""
@@ -313,12 +410,14 @@ class MessageRecall(Star):
             data = getattr(component, "data", None)
             if isinstance(data, dict):
                 key = str(data.get("k", ""))
-            if key not in TYPE_KEYS:
-                # 兼容只带按钮 id 的情况（旧版 AstrBot 不解码 data）
+            elif isinstance(data, str):
+                key = data.removeprefix(BUTTON_ID_PREFIX)
+            if key not in SWITCH_KEYS:
+                # 兜底：只带按钮 id 时按 id 反解
                 key = str(getattr(component, "action_id", "")).removeprefix(
                     BUTTON_ID_PREFIX
                 )
-            return key if key in TYPE_KEYS else ""
+            return key if key in SWITCH_KEYS else ""
         return ""
 
     async def _apply_toggle(self, key: str) -> str:
@@ -326,9 +425,10 @@ class MessageRecall(Star):
         enabled = self._toggle_flag(key)
         saved = await self._save_config()
         suffix = "" if saved else "（保存失败，重启后可能复原）"
+        keys = TYPE_KEYS if key in TYPE_KEYS else ("notify", "notify_at")
         return (
-            f"{TYPE_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
-            f"{self._status_line()}"
+            f"{SWITCH_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
+            f"{self._switch_line(keys)}"
         )
 
     # ------------------------------------------------------------------
@@ -580,9 +680,11 @@ class MessageRecall(Star):
         text = event.message_str or ""
 
         # 2. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
-        # 谁能发都行，面板照发；点不点得动由平台按 permission.type=2 判角色。
+        # 谁能发都行，面板照发；点不点得动由按钮的 permission.type=1 决定。
         if text.strip() == MENU_WORD:
-            yield event.chain_result(self._menu_chain())
+            if not await self._send_menu(event):
+                # 发不出带按钮的消息（老版本/接口拒绝）时退成一条纯文本状态
+                yield event.plain_result(f"{MENU_TITLE}\n{self._status_line()}")
             event.stop_event()
             return
 
