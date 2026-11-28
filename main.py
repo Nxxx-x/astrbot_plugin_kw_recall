@@ -26,6 +26,15 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
+# 按钮面板依赖较新的 AstrBot（ActionRow / Button / ButtonInteraction）。
+# 老版本没有这几个组件时，"菜单"自动降级为纯文本状态，其余功能不受影响。
+try:
+    from astrbot.api.message_components import ActionRow, Button, ButtonInteraction
+except Exception:  # pragma: no cover - 取决于 AstrBot 版本
+    ActionRow = None  # type: ignore[assignment]
+    Button = None  # type: ignore[assignment]
+    ButtonInteraction = None  # type: ignore[assignment]
+
 try:  # 官机适配器依赖 botpy，理论上必装；缺失时插件仍可加载
     from botpy.http import Route
 except Exception:  # pragma: no cover
@@ -57,6 +66,17 @@ LINK_RE = re.compile(
 )
 
 TYPE_KEYS = ("keyword", "number", "link", "qrcode", "emoji")
+TYPE_LABELS = {
+    "keyword": "关键词",
+    "number": "号码",
+    "link": "链接",
+    "qrcode": "二维码",
+    "emoji": "表情",
+}
+# 群里发这两个字就弹出开关面板
+MENU_WORD = "菜单"
+MENU_TEXT = "撤回开关 · 点按钮切换（仅群管理员/群主可点）"
+BUTTON_ID_PREFIX = "kwrecall_"
 DEFAULT_REPLIES = {
     "keyword": "消息含有关键词，已撤回",
     "number": "请勿发送号码，已撤回",
@@ -216,6 +236,100 @@ class MessageRecall(Star):
 
     def _active_types(self) -> list[str]:
         return [key for key in TYPE_KEYS if self._on(key)]
+
+    # ------------------------------------------------------------------
+    # 开关面板（群管理员点按钮改配置）
+    # ------------------------------------------------------------------
+
+    def _status_line(self) -> str:
+        """一行显示五类开关状态，如「关键词 开 · 号码 关 · …」。"""
+        return " · ".join(
+            f"{TYPE_LABELS[key]} {'开' if self._on(key) else '关'}" for key in TYPE_KEYS
+        )
+
+    def _menu_chain(self) -> list[Any]:
+        """菜单消息：一句说明 + 一排按钮，开=蓝、关=灰。"""
+        if ActionRow is None or Button is None:
+            return [Comp.Plain(f"{MENU_TEXT}\n{self._status_line()}")]
+
+        buttons = []
+        for key in TYPE_KEYS:
+            on = self._on(key)
+            buttons.append(
+                Button(
+                    id=f"{BUTTON_ID_PREFIX}{key}",
+                    label=f"{TYPE_LABELS[key]} {'开' if on else '关'}",
+                    action=Button.CallbackAction(data={"k": key}),
+                    style=Button.Style.SUCCESS if on else Button.Style.DEFAULT,
+                )
+            )
+        return [
+            Comp.Plain(MENU_TEXT),
+            ActionRow(buttons=buttons, fallback_text=self._status_line()),
+        ]
+
+    def _toggle_flag(self, key: str) -> bool:
+        """翻转某一类开关并返回新状态；配置里缺这一组时补出来。"""
+        group = self.config.get(key)
+        if not isinstance(group, dict):
+            group = {}
+            self.config[key] = group
+        group["enabled"] = not self._on(key)
+        return group["enabled"]
+
+    async def _save_config(self) -> bool:
+        """把改动写回 data/config/<plugin>_config.json。"""
+        try:
+            saver = getattr(self.config, "save_config_async", None)
+            if callable(saver):
+                await saver()
+            else:
+                self.config.save_config()  # type: ignore[attr-defined]
+            return True
+        except Exception as exc:
+            logger.warning(f"[kw_recall] 配置保存失败：{exc}")
+            return False
+
+    @staticmethod
+    def _interaction_key(event: AstrMessageEvent) -> str:
+        """从按钮点击事件里取出被点的类型；不是按钮事件或参数不认识时返回空串。
+
+        管理员身份由 QQ 平台保证：AstrBot 下发键盘时固定 permission.type=2，
+        非管理员/群主在客户端点不动，所以这里不再重复查角色（官机也没有群成员
+        角色接口）。
+        """
+        if ButtonInteraction is None:
+            return ""
+        try:
+            components = event.get_messages() or []
+        except Exception:
+            return ""
+
+        for component in components:
+            if not isinstance(component, ButtonInteraction):
+                continue
+
+            key = ""
+            data = getattr(component, "data", None)
+            if isinstance(data, dict):
+                key = str(data.get("k", ""))
+            if key not in TYPE_KEYS:
+                # 兼容只带按钮 id 的情况（旧版 AstrBot 不解码 data）
+                key = str(getattr(component, "action_id", "")).removeprefix(
+                    BUTTON_ID_PREFIX
+                )
+            return key if key in TYPE_KEYS else ""
+        return ""
+
+    async def _apply_toggle(self, key: str) -> str:
+        """切换开关、写回配置，返回给群里的那行提示。"""
+        enabled = self._toggle_flag(key)
+        saved = await self._save_config()
+        suffix = "" if saved else "（保存失败，重启后可能复原）"
+        return (
+            f"{TYPE_LABELS[key]}已{'开启' if enabled else '关闭'}{suffix}\n"
+            f"{self._status_line()}"
+        )
 
     # ------------------------------------------------------------------
     # 匹配
@@ -451,7 +565,28 @@ class MessageRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群消息入口：命中任一规则就撤回，按配置发提示。"""
+        """群消息入口：菜单、按钮点击、五类规则。"""
+        # 1. 按钮点击：message_str 是空的，消息体是 ButtonInteraction 组件
+        key = (
+            self._interaction_key(event)
+            if not (event.message_str or "").strip()
+            else ""
+        )
+        if key:
+            yield event.plain_result(await self._apply_toggle(key))
+            event.stop_event()
+            return
+
+        text = event.message_str or ""
+
+        # 2. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉
+        if text.strip() == MENU_WORD:
+            if self._is_group_admin(event):
+                yield event.chain_result(self._menu_chain())
+            event.stop_event()
+            return
+
+        # 3. 五类规则
         active = self._active_types()
         if not active:
             return
@@ -459,7 +594,6 @@ class MessageRecall(Star):
             # 只剩关键词但词表是空的，没什么可匹配
             return
 
-        text = event.message_str or ""
         hit = self._match_text(text) if text.strip() else None
         if hit is None and self._on("qrcode"):
             hit = await self._match_qrcode(event)
