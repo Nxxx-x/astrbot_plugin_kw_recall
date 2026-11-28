@@ -6,10 +6,10 @@
     "hint": "群内发「菜单」时按钮上方那行字。只能在这里改，菜单里没有改标题的按钮；留空则用默认值，换行会压成一行，最多 40 字"
   },
   "notify": {
-    "description": "撤回后发提示并艾特发送者",
+    "description": "全局提示",
     "type": "bool",
     "default": true,
-    "hint": "关闭则只撤回、不发言；开着时提示会艾特被撤回的人。五类各自的提示文案见下方分组"
+    "hint": "撤回或禁言后是否发提示并艾特当事人；关闭则只处理、不发言。五类规则的提示文案与刷屏提示都受它控制"
   },
   "keyword": {
     "description": "违禁词撤回",
@@ -104,6 +104,41 @@
         "type": "string",
         "default": "请勿发送emoji，已撤回",
         "hint": "留空表示这一类撤回后不发言"
+      }
+    }
+  },
+  "flood": {
+    "description": "刷屏检测",
+    "type": "object",
+    "hint": "同一成员在 1 秒内发言达到阈值就禁言；需要机器人是群管理员，且只能禁言普通成员",
+    "items": {
+      "enabled": {
+        "description": "启用刷屏检测",
+        "type": "bool",
+        "default": true
+      },
+      "threshold": {
+        "description": "每秒消息条数阈值",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        },
+        "hint": "拖动选择：1=一秒一条，2=一秒两条，3=一秒三条……10=一秒十条；0 表示不检测"
+      },
+      "duration": {
+        "description": "禁言时长（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "默认 60 秒；范围 1~2592000（30 天），超出按边界处理"
+      },
+      "reply": {
+        "description": "刷屏提示文案",
+        "type": "string",
+        "default": "刷屏太快，已禁言 {duration}",
+        "hint": "可用 {duration} 占位符，会替换成禁言时长；留空表示禁言后不发言。受「全局提示」控制，开着必艾特"
       }
     }
   }

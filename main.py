@@ -20,7 +20,9 @@ import json
 import os
 import random
 import re
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import astrbot.api.message_components as Comp
@@ -45,7 +47,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.13.2"
+PLUGIN_VERSION = "1.14.0"
 
 
 def _resolve_button_registrar():
@@ -97,22 +99,27 @@ LINK_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 面板与降级文本里的排列顺序：五类规则 + 一个提示开关。
+# 面板与降级文本里的排列顺序：五类规则。
 # 注意这只是展示顺序，文本匹配的先后在 _match_text 里另有一套。
 TYPE_KEYS = ("keyword", "link", "number", "qrcode", "emoji")
-# 面板上的全部开关：五类规则 + 撤回提示。
-# 提示只有开/关两种状态，开着就一定艾特发送者，不再单列「艾特」开关。
-SWITCH_KEYS = TYPE_KEYS + ("notify",)
-# 按钮文案。一行两个按钮时每个只有半屏宽，所以六项都压到 4 个字
+# 面板上的开关：全局提示排第一，然后是五类规则，最后是刷屏检测。
+# 全局提示只有开/关两种状态，开着就一定艾特发送者，不再单列「艾特」开关。
+SWITCH_KEYS = ("notify",) + TYPE_KEYS + ("flood",)
+# 面板上唯一一个动作按钮（不是开关）：一键解除本群所有禁言。
+ACTION_UNMUTE = "unmute_all"
+# 按钮文案。一行两个按钮时每个只有半屏宽，所以都压到 4 个字
 # （「撤」或「撤回」+ 类型名），加「 开/关」正好 5 个字位，一列放得下。
 SWITCH_LABELS = {
+    "notify": "全局提示",
     "keyword": "撤违禁词",
     "link": "撤回链接",
     "number": "撤回号码",
     "qrcode": "撤二维码",
     "emoji": "撤回表情",
-    "notify": "撤回提示",
+    "flood": "刷屏检测",
 }
+# 动作按钮的文案固定，不随状态变：点一次解禁一次，没有「开/关」可言。
+UNMUTE_LABEL = "一键解禁 解"
 # 点击后的回执：只说结果（已开 / 已关）。点的是哪个开关就在眼前，
 # 再重复一遍类型名反而是噪音；要看最新状态重发一次「菜单」。
 FEEDBACK_TEXT = {True: "已开", False: "已关"}
@@ -148,6 +155,17 @@ DEFAULT_ENABLED = {
     "qrcode": True,
     "emoji": True,
 }
+# 刷屏检测：同一成员 1 秒内发言达到 threshold 条就禁言 duration 秒。
+# threshold=0 视为关闭（滑块拖到最左边），与开关关掉等价。
+FLOOD_DEFAULT_THRESHOLD = 3
+FLOOD_MAX_THRESHOLD = 10
+FLOOD_DEFAULT_DURATION = 60
+FLOOD_MAX_DURATION = 30 * 24 * 3600  # 官方上限 30 天
+FLOOD_DEFAULT_REPLY = "刷屏太快，已禁言 {duration}"
+FLOOD_WINDOW = 1.0  # 秒：统计窗口
+FLOOD_WINDOW_MAX_KEYS = 1024  # 窗口字典超过这个数就清理一遍空条目
+FLOOD_FAIL_COOLDOWN = 10.0  # 禁言失败后这段时间内不再试，免得刷接口
+MUTE_BATCH = 10  # 官方限制：单次最多 10 个成员
 
 # QQ 官机的原生表情（含超级表情、收藏的表情包）不以 Unicode 字符下发，
 # 适配器会把 <faceType=4,...> 转成 [表情:描述] 或 [表情]。这类属于 QQ 自带
@@ -163,6 +181,13 @@ AT_TAG_RE = re.compile(r"<qqbot-at-user\b[^>]*>|<@!?[^>]*>", re.IGNORECASE)
 def _strip_markup(text: str) -> str:
     """剥掉官机的 @ 与表情标签，只留用户真正打的文字。"""
     return AT_TAG_RE.sub("", FACE_TAG_RE.sub("", text))
+
+
+def _pick(obj: Any, key: str, default: Any = None) -> Any:
+    """从接口响应里取字段：botpy 各版本可能回 dict，也可能回带属性的对象。"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 # 标准库 re 没有 Unicode 属性，只能按区段兜底；装了 regex 就用
@@ -208,6 +233,8 @@ QR_CONCURRENCY = 2
 # 权限（40062003）。这类不刷 warning，否则群里一条漏撤就报一次，日志会被冲爆。
 RECALL_EXPIRED = "40064004"
 RECALL_FORBIDDEN = "40062003"
+# 禁言/解禁走的是另一个接口，但权限错误码相同：机器人不是管理员
+MUTE_FORBIDDEN = RECALL_FORBIDDEN
 
 
 def _has_emoji(text: str) -> bool:
@@ -258,6 +285,10 @@ class MessageRecall(Star):
         self._kw_pairs: list[tuple[str, str]] = []
         # 命令入口与文本入口可能命同一条消息，用 message_id 去重，别弹两套面板
         self._menu_msg_id = ""
+        # 刷屏检测的滑动窗口：(群, 成员) -> 最近 1 秒内每条消息的时间戳
+        self._flood_windows: dict[tuple[str, str], deque[float]] = {}
+        # 已禁言到什么时候（含失败后的短冷却）：冷却期内不再重复调用禁言接口
+        self._mute_until: dict[tuple[str, str], float] = {}
         # 老版本有独立的「提示艾特人」开关，现在并入「撤回提示」：提示开着就艾特。
         # 这里只清内存里的残留键，不主动写盘，等下次保存时自然从文件里消失。
         if "notify_at" in self.config:
@@ -280,7 +311,7 @@ class MessageRecall(Star):
         return bool(self.config.get("notify", True))
 
     def _on(self, key: str) -> bool:
-        raw = self._group(key).get("enabled", DEFAULT_ENABLED[key])
+        raw = self._group(key).get("enabled", DEFAULT_ENABLED.get(key, True))
         return bool(raw)
 
     def _reply(self, key: str) -> str:
@@ -300,6 +331,45 @@ class MessageRecall(Star):
         title = " ".join(str(raw).split())
         return title[:MAX_MENU_TITLE_LEN] or DEFAULT_MENU_TITLE
 
+    def _flood_threshold(self) -> int:
+        """每秒消息条数阈值，0~10；超出范围按边界裁剪，脏数据回退默认值。"""
+        raw = self._group("flood").get("threshold", FLOOD_DEFAULT_THRESHOLD)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return FLOOD_DEFAULT_THRESHOLD
+        return max(0, min(FLOOD_MAX_THRESHOLD, value))
+
+    def _flood_duration(self) -> int:
+        """禁言时长（秒），1~30 天；脏数据回退 60 秒。"""
+        raw = self._group("flood").get("duration", FLOOD_DEFAULT_DURATION)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return FLOOD_DEFAULT_DURATION
+        return max(1, min(FLOOD_MAX_DURATION, value))
+
+    def _flood_reply(self) -> str:
+        raw = self._group("flood").get("reply", FLOOD_DEFAULT_REPLY)
+        if raw is None:
+            raw = FLOOD_DEFAULT_REPLY
+        return str(raw).strip()[:MAX_REPLY_LEN]
+
+    def _flood_on(self) -> bool:
+        """刷屏检测是否生效：开关开着且阈值大于 0（滑块拖到 0 等于关）。"""
+        enabled = bool(self._group("flood").get("enabled", True))
+        return enabled and self._flood_threshold() > 0
+
+    @staticmethod
+    def _human_duration(seconds: int) -> str:
+        """把秒数写成「30 秒 / 1 分钟 / 1 分 30 秒」，用在提示文案里。"""
+        if seconds < 60:
+            return f"{seconds} 秒"
+        minutes, rest = divmod(seconds, 60)
+        if not rest:
+            return f"{minutes} 分钟"
+        return f"{minutes} 分 {rest} 秒"
+
     def _keyword_pairs(self) -> list[tuple[str, str]]:
         """返回 (原词, 小写词)；配置没改时直接复用缓存，避免每条消息重解析+重 lower。"""
         raw = self._group("keyword").get("list", "")
@@ -317,7 +387,9 @@ class MessageRecall(Star):
     # ------------------------------------------------------------------
 
     def _switch_on(self, key: str) -> bool:
-        """取某个开关的当前状态：五类规则看分组里的 enabled，提示项看顶层布尔。"""
+        """取某个开关的当前状态：规则看分组里的 enabled，提示项看顶层布尔。"""
+        if key == "flood":
+            return self._flood_on()
         if key in TYPE_KEYS:
             return self._on(key)
         return self._notify()
@@ -330,32 +402,52 @@ class MessageRecall(Star):
         )
 
     @staticmethod
-    def _keyboard_rows(keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
-        """一行两个按钮，开=蓝(1)、关=灰(0)；permission 用 1=仅管理者可操作。"""
+    def _button(key: str, label: str, style: int) -> dict[str, Any]:
+        return {
+            "id": f"{BUTTON_ID_PREFIX}{key}",
+            "render_data": {
+                "label": label,
+                "visited_label": label,
+                "style": style,
+            },
+            "action": {
+                "type": 1,  # 回调按钮，点了会推 INTERACTION_CREATE
+                "permission": {"type": PERMISSION_ADMIN_ONLY},
+                "data": f"{BUTTON_ID_PREFIX}{key}",
+            },
+        }
+
+    @classmethod
+    def _switch_buttons(cls, keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
+        """开关按钮：开=蓝(1)、关=灰(0)。"""
         buttons: list[dict[str, Any]] = []
         for key in keys:
             on = on_of(key)
             label = f"{SWITCH_LABELS[key]} {'开' if on else '关'}"
-            buttons.append(
-                {
-                    "id": f"{BUTTON_ID_PREFIX}{key}",
-                    "render_data": {
-                        "label": label,
-                        "visited_label": label,
-                        "style": 1 if on else 0,
-                    },
-                    "action": {
-                        "type": 1,  # 回调按钮，点了会推 INTERACTION_CREATE
-                        "permission": {"type": PERMISSION_ADMIN_ONLY},
-                        "data": f"{BUTTON_ID_PREFIX}{key}",
-                    },
-                }
-            )
-        # 一行两个；6 个开关正好三行，一条键盘发得下
+            buttons.append(cls._button(key, label, 1 if on else 0))
+        return buttons
+
+    @staticmethod
+    def _chunk(buttons: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {"buttons": buttons[i : i + BUTTONS_PER_ROW]}
             for i in range(0, len(buttons), BUTTONS_PER_ROW)
         ]
+
+    @classmethod
+    def _keyboard_rows(cls, keys: tuple[str, ...], on_of) -> list[dict[str, Any]]:
+        """一行两个按钮；7 个开关正好四行，QQ 单条上限 5 行。"""
+        return cls._chunk(cls._switch_buttons(keys, on_of))
+
+    def _menu_rows(self) -> list[dict[str, Any]]:
+        """菜单的完整键盘：7 个开关 + 一个「一键解禁」动作按钮，共 8 个、四行。
+
+        解禁按钮文案固定、始终蓝色——它不是开关，点一下就是一次动作，
+        没有「开/关」状态可显示。
+        """
+        buttons = self._switch_buttons(SWITCH_KEYS, self._switch_on)
+        buttons.append(self._button(ACTION_UNMUTE, UNMUTE_LABEL, 1))
+        return self._chunk(buttons)
 
     async def _send_keyboard(
         self, event: AstrMessageEvent, text: str, rows: list[dict[str, Any]]
@@ -409,11 +501,11 @@ class MessageRecall(Star):
         return False
 
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
-        """发开关面板：6 个开关、一行两个，三行一条消息发完。
+        """发面板：7 个开关 + 一键解禁，一行两个、四行一条消息发完。
 
         正文就是配置里的菜单标题（默认 RECALL SETTINGS），开关状态全在按钮 label 上。
         """
-        rows = self._keyboard_rows(SWITCH_KEYS, self._switch_on)
+        rows = self._menu_rows()
         return await self._send_keyboard(event, self._menu_title(), rows)
 
     def _claim_menu(self, event: AstrMessageEvent) -> bool:
@@ -439,6 +531,19 @@ class MessageRecall(Star):
 
     def _toggle_flag(self, key: str) -> bool:
         """翻转一个开关并返回新状态；配置里缺字段时补出来。"""
+        if key == "flood":
+            group = self.config.get("flood")
+            if not isinstance(group, dict):
+                group = {}
+                self.config["flood"] = group
+            enabled = not self._switch_on("flood")
+            group["enabled"] = enabled
+            # 阈值拖到 0 时按钮显示「关」；这时再点一下要真能开起来，
+            # 顺手把阈值拉回默认，否则开关打开了、状态却还是关。
+            if enabled and self._flood_threshold() == 0:
+                group["threshold"] = FLOOD_DEFAULT_THRESHOLD
+            return enabled
+
         if key in TYPE_KEYS:
             group = self.config.get(key)
             if not isinstance(group, dict):
@@ -484,7 +589,7 @@ class MessageRecall(Star):
 
         for value in candidates:
             key = value.strip().removeprefix(BUTTON_ID_PREFIX).strip()
-            if key in SWITCH_KEYS:
+            if key in SWITCH_KEYS or key == ACTION_UNMUTE:
                 return key
         return ""
 
@@ -599,6 +704,20 @@ class MessageRecall(Star):
         if saved and (stored is None or stored == enabled):
             return FEEDBACK_TEXT[enabled]
         return "保存失败，请到面板改"
+
+    async def _handle_button(self, event: AstrMessageEvent) -> str | None:
+        """处理按钮点击：开关回「已开/已关」，解禁回统计结果。
+
+        返回 None 表示按钮不属于本插件（交给别的插件），空串表示认领但无回执。
+        """
+        key = self._interaction_key(event)
+        if not key:
+            return None
+        if key == ACTION_UNMUTE:
+            logger.info("[kw_recall] 按钮点击 → 一键解禁")
+            return await self._unmute_all(event)
+        logger.info(f"[kw_recall] 按钮点击 → {SWITCH_LABELS[key]}")
+        return await self._apply_toggle(key) or ""
 
     # ------------------------------------------------------------------
     # 匹配
@@ -827,6 +946,195 @@ class MessageRecall(Star):
         )
         await http.request(route)
 
+    @staticmethod
+    def _bot_http(event: AstrMessageEvent) -> Any:
+        """取 botpy 的 http 客户端；新版挂在 api._http，旧版在 api.http。"""
+        api = getattr(getattr(event, "bot", None), "api", None)
+        return getattr(api, "_http", None) or getattr(api, "http", None)
+
+    async def _group_request(
+        self,
+        event: AstrMessageEvent,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        **params: str,
+    ) -> Any:
+        """调群管理接口。GET 直接请求，POST 带 JSON 体。"""
+        if Route is None:
+            raise RuntimeError("未找到 botpy，当前环境无法调用群管理接口")
+        http = self._bot_http(event)
+        if http is None:
+            raise RuntimeError("当前 botpy 版本不支持该群管理接口")
+        route = Route(method, path, **params)
+        if payload is None:
+            return await http.request(route)
+        try:
+            return await http.request(route, json=payload)
+        except TypeError:
+            # 个别老版本 request 没有 json 关键字，退回自己序列化
+            return await http.request(route, data=json.dumps(payload))
+
+    async def _mute_member(
+        self, event: AstrMessageEvent, member_openid: str, seconds: int
+    ) -> None:
+        """禁言一个成员：op=add，到期时间用 RFC3339（官方要求）。"""
+        expire_at = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(
+            timespec="seconds"
+        )
+        await self._group_request(
+            event,
+            "POST",
+            "/v2/groups/{group_openid}/restrict_chat_setting",
+            {
+                "members": [
+                    {
+                        "op": "add",
+                        "member_openid": member_openid,
+                        "mute_expire_at": expire_at,
+                    }
+                ]
+            },
+            group_openid=str(event.get_group_id()),
+        )
+
+    async def _mute_states(self, event: AstrMessageEvent) -> list[Any]:
+        """查当前处于禁言中的成员列表（不含已过期）。"""
+        data = await self._group_request(
+            event,
+            "GET",
+            "/v2/groups/{group_openid}/restrict_chat_setting",
+            group_openid=str(event.get_group_id()),
+        )
+        members = _pick(data, "members", [])
+        return list(members) if isinstance(members, (list, tuple)) else []
+
+    async def _unmute_all(self, event: AstrMessageEvent) -> str:
+        """一键解禁：查列表 → 按每批 10 个 op=del，返回一句回执。"""
+        try:
+            members = await self._mute_states(event)
+        except Exception as exc:
+            detail = str(exc)
+            if MUTE_FORBIDDEN in detail:
+                logger.debug(f"[kw_recall] 读取禁言列表无权限：{detail[:120]}")
+                return "解禁失败：机器人没有管理权限"
+            logger.warning(f"[kw_recall] 读取禁言列表失败：{detail[:200]}")
+            return "解禁失败，请稍后再试"
+
+        ids = [
+            str(openid)
+            for openid in (_pick(item, "member_openid", "") for item in members)
+            if openid
+        ]
+        if not ids:
+            return "本群没有被禁言的人"
+
+        done = 0
+        failed = 0
+        for start in range(0, len(ids), MUTE_BATCH):
+            batch = ids[start : start + MUTE_BATCH]
+            try:
+                await self._group_request(
+                    event,
+                    "POST",
+                    "/v2/groups/{group_openid}/restrict_chat_setting",
+                    {
+                        "members": [
+                            {"op": "del", "member_openid": openid, "mute_expire_at": ""}
+                            for openid in batch
+                        ]
+                    },
+                    group_openid=str(event.get_group_id()),
+                )
+                done += len(batch)
+            except Exception as exc:
+                failed += len(batch)
+                logger.warning(
+                    f"[kw_recall] 解禁失败（{len(batch)} 人）：{str(exc)[:200]}"
+                )
+
+        logger.info(f"[kw_recall] 一键解禁：成功 {done} 人，失败 {failed} 人")
+        if not done:
+            return "解禁失败，请检查机器人权限"
+        if failed:
+            return f"已解禁 {done} 人，{failed} 人失败"
+        return f"已解禁 {done} 人"
+
+    # ------------------------------------------------------------------
+    # 刷屏检测（1 秒窗口 + 禁言）
+    # ------------------------------------------------------------------
+
+    def _prune_flood(self, now: float) -> None:
+        """字典太大时清掉过期条目，长期运行不会越攒越多。"""
+        if len(self._mute_until) > FLOOD_WINDOW_MAX_KEYS:
+            for key, until in list(self._mute_until.items()):
+                if until <= now:
+                    self._mute_until.pop(key, None)
+        if len(self._flood_windows) > FLOOD_WINDOW_MAX_KEYS:
+            for key, window in list(self._flood_windows.items()):
+                if not window:
+                    self._flood_windows.pop(key, None)
+
+    async def _check_flood(self, event: AstrMessageEvent) -> str:
+        """记一条消息；1 秒内达到阈值就禁言，返回要发的提示（空串表示不发言）。
+
+        阈值按「条/秒」算：窗口固定 1 秒，拖到 3 就是 1 秒 3 条触发。禁言成功后
+        按禁言时长做冷却，冷却期内的消息不再计数，也不会重复调接口。
+        """
+        if not self._flood_on():
+            return ""
+        # 管理员与群主禁不了，也不该禁；机器人自己更不会走到这里
+        if self._is_group_admin(event):
+            return ""
+
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+        if not group_id or not sender_id:
+            return ""
+
+        now = time.monotonic()
+        self._prune_flood(now)
+        key = (group_id, sender_id)
+        if self._mute_until.get(key, 0.0) > now:
+            return ""
+
+        window = self._flood_windows.setdefault(key, deque())
+        window.append(now)
+        while window and now - window[0] > FLOOD_WINDOW:
+            window.popleft()
+
+        threshold = self._flood_threshold()
+        if len(window) < threshold:
+            return ""
+
+        count = len(window)
+        window.clear()
+        seconds = self._flood_duration()
+        try:
+            await self._mute_member(event, sender_id, seconds)
+        except Exception as exc:
+            detail = str(exc)
+            # 失败也压一段冷却，否则一个人刷屏会连着打接口、刷满日志
+            self._mute_until[key] = now + FLOOD_FAIL_COOLDOWN
+            if MUTE_FORBIDDEN in detail:
+                logger.debug(f"[kw_recall] 禁言失败（无管理权限）：{detail[:120]}")
+            else:
+                logger.warning(f"[kw_recall] 禁言失败：{detail[:200]}")
+            return ""
+
+        self._mute_until[key] = now + seconds
+        logger.info(
+            f"[kw_recall] 刷屏禁言 {sender_id} {seconds}s（1 秒 {count} 条，"
+            f"阈值 {threshold}）"
+        )
+
+        if not self._notify():
+            return ""
+        text = self._flood_reply()
+        if not text:
+            return ""
+        return text.replace("{duration}", self._human_duration(seconds))
+
     # ------------------------------------------------------------------
     # 消息监听
     # ------------------------------------------------------------------
@@ -842,14 +1150,12 @@ class MessageRecall(Star):
             的 handler，普通 event_message_type 监听收不到点击。所以点击单独注册在
             这里，按按钮 id 前缀认领，别人的按钮原样放行。
             """
-            key = self._interaction_key(event)
-            if not key:
+            reply = await self._handle_button(event)
+            if reply is None:
                 logger.debug(
                     f"[kw_recall] 按钮点击未认领：{self._describe_interaction(event)}"
                 )
                 return
-            logger.info(f"[kw_recall] 按钮点击 → {SWITCH_LABELS[key]}")
-            reply = await self._apply_toggle(key)
             if reply:
                 yield event.plain_result(reply)
             event.stop_event()
@@ -858,7 +1164,7 @@ class MessageRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def cmd_menu(self, event: AstrMessageEvent):
-        """弹出撤回开关面板：五类规则 + 两个提示项，点按钮即切换"""
+        """弹出面板：全局提示、五类规则、刷屏检测、一键解禁"""
         # 命令过滤只要开头对上就放行（后面跟字会被当参数），这里收紧成精确匹配，
         # 让「菜单 你好」这类照旧不触发；唤醒前缀（/菜单、!菜单）先剥掉再比。
         # 正文为空说明框架已把命令词吃掉，直接认下。
@@ -874,14 +1180,13 @@ class MessageRecall(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
-        """群消息入口：菜单、五类规则。"""
+        """群消息入口：菜单、刷屏检测、五类规则。"""
         # 按钮点击是另一条链路（on_button_click），这里只管文字消息。
         # 老版本 AstrBot 没有 ButtonActionFilter 时，点击事件会落到这里，兜一下。
         text = event.message_str or ""
         if BUTTON_REGISTRAR is None and not text.strip():
-            key = self._interaction_key(event)
-            if key:
-                reply = await self._apply_toggle(key)
+            reply = await self._handle_button(event)
+            if reply is not None:
                 if reply:
                     yield event.plain_result(reply)
                 event.stop_event()
@@ -897,7 +1202,18 @@ class MessageRecall(Star):
             event.stop_event()
             return
 
-        # 2. 五类规则
+        # 2. 刷屏检测：与五类规则互相独立，禁言后本条仍可能继续命中撤回规则
+        flood_reply = await self._check_flood(event)
+        if flood_reply:
+            sender_id = event.get_sender_id()
+            if sender_id:
+                yield event.chain_result(
+                    [Comp.At(qq=sender_id), Comp.Plain(f" {flood_reply}")]
+                )
+            else:
+                yield event.plain_result(flood_reply)
+
+        # 3. 五类规则
         active = self._active_types()
         if not active:
             return
