@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.11.1"
+PLUGIN_VERSION = "1.11.2"
 
 
 def _resolve_button_registrar():
@@ -102,7 +102,8 @@ TYPE_KEYS = ("keyword", "number", "link", "qrcode", "emoji")
 SWITCH_KEYS = TYPE_KEYS + ("notify", "notify_at")
 # 按钮文案：一行一个按钮，字要短但要看得懂。带「撤回」前缀是为了让人一眼看出
 # 这一屏幕管的是撤回，而不是群规或别的开关。
-# QQ 按钮文案上限 10 字，最长的一项是「撤回连续数字 开」（8 字），留有余量。
+# QQ 按钮文案上限 10 字，最长的一项是「撤回提示艾特人 开」（9 字），留有余量。
+# 按钮上不用半角 @：手机上又小又容易看成别的符号，统一写成中文「艾特」。
 SWITCH_LABELS = {
     "keyword": "撤回关键词",
     "number": "撤回连续数字",
@@ -110,7 +111,7 @@ SWITCH_LABELS = {
     "qrcode": "撤回二维码",
     "emoji": "撤回emoji",
     "notify": "撤回提示",
-    "notify_at": "撤回提示@人",
+    "notify_at": "撤回提示艾特人",
 }
 # 点击后的反馈文案：把「撤回」挪到后面，读起来像一句结论（关键词撤回 关），
 # 和按钮上的「撤回关键词 开」区分开，不至于看起来像同一句话。
@@ -121,14 +122,14 @@ FEEDBACK_LABELS = {
     "qrcode": "二维码撤回",
     "emoji": "emoji撤回",
     "notify": "撤回提示",
-    "notify_at": "提示@人",
+    "notify_at": "提示艾特人",
 }
 # QQ 键盘最多 5 行、每行最多 5 个按钮；这里一行放一个按钮，所以一条键盘最多 5 个开关
 SWITCHES_PER_KEYBOARD = 5
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
 # 面板正文不放字：按钮上已经写着「撤回关键词 开」，再写标题纯属重复。
-# 部分接口不接受空 content，用零宽空格占位，视觉上就是没有文字。
+# 官机没有纯按钮消息，正文总要占一行，所以先试空串，平台不收时才用零宽空格占位。
 EMPTY_TEXT = "\u200b"
 BUTTON_ID_PREFIX = "kwrecall_"
 # 按钮权限：0 指定用户、1 仅管理者、2 所有人、3 指定身份组（仅频道）
@@ -352,7 +353,13 @@ class MessageRecall(Star):
 
         AstrBot 自己的 keyboard 序列化把 permission 写死成 2（所有人可点），
         所以这里绕开它自己拼 payload，换成 1（仅群主/管理员可点）。
-        markdown 被平台拒绝时退到纯文本正文，按钮照发。
+
+        官机没有「只有按钮」的消息类型，按钮必须挂在 text / markdown 正文上，
+        正文再空也会占一行，所以按「空白从小到大」挨个试：
+          1. markdown 正文空串——平台若放行，气泡里就只剩按钮，一点空白都没有；
+          2. 纯文本零宽空格——纯文本气泡行高比 markdown 段落矮，空白明显更小；
+          3. markdown 零宽空格——最保底的一种，前两种都被拒时用。
+        每一档都先试被动回复（带 msg_id），再试主动发送。
         """
         api = getattr(getattr(event, "bot", None), "api", None)
         group_id = event.get_group_id()
@@ -361,36 +368,34 @@ class MessageRecall(Star):
 
         msg_id = getattr(event.message_obj, "message_id", "") or ""
         keyboard = {"content": {"rows": rows}}
-        base: dict[str, Any] = {
-            "group_openid": group_id,
-            "keyboard": keyboard,
-            "msg_seq": random.randint(1, 10000),
-        }
-        if msg_id:
-            base["msg_id"] = msg_id
 
-        # 依次尝试：markdown 被动回复 → markdown 主动发送 → 纯文本被动 → 纯文本主动
-        candidates: list[dict[str, Any]] = []
-        for with_md in (True, False):
-            for with_id in (True, False) if msg_id else (False,):
-                payload = dict(base)
-                if with_md:
-                    payload["msg_type"] = 2
-                    payload["markdown"] = {"content": text}
-                else:
-                    payload["msg_type"] = 0
-                    payload["content"] = text
-                if not with_id:
-                    payload.pop("msg_id", None)
-                candidates.append(payload)
+        if text.strip(EMPTY_TEXT):
+            # 有真文字时按老顺序：markdown 观感更好，被拒再退纯文本
+            variants = ((True, text), (False, text))
+        else:
+            variants = ((True, ""), (False, EMPTY_TEXT), (True, EMPTY_TEXT))
 
         last: Exception | None = None
-        for payload in candidates:
-            try:
-                await api.post_group_message(**payload)
-                return True
-            except Exception as exc:  # 换一种发法再试
-                last = exc
+        for with_md, content in variants:
+            for with_id in (True, False) if msg_id else (False,):
+                payload: dict[str, Any] = {
+                    "group_openid": group_id,
+                    "keyboard": keyboard,
+                    "msg_seq": random.randint(1, 10000),
+                }
+                if with_id:
+                    payload["msg_id"] = msg_id
+                if with_md:
+                    payload["msg_type"] = 2
+                    payload["markdown"] = {"content": content}
+                else:
+                    payload["msg_type"] = 0
+                    payload["content"] = content
+                try:
+                    await api.post_group_message(**payload)
+                    return True
+                except Exception as exc:  # 换一种发法再试
+                    last = exc
         logger.warning(f"[kw_recall] 菜单发送失败：{last}")
         return False
 
