@@ -1,4 +1,10 @@
 {
+  "menu_title": {
+    "description": "菜单标题",
+    "type": "string",
+    "default": "RECALL SETTINGS",
+    "hint": "群内发「菜单」时按钮上方那行字。只能在这里改，菜单里没有改标题的按钮；留空则用默认值，换行会压成一行，最多 40 字"
+  },
   "notify": {
     "description": "撤回后发提示并艾特发送者",
     "type": "bool",

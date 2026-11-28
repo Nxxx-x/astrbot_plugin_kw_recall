@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.12.0"
+PLUGIN_VERSION = "1.13.0"
 
 
 def _resolve_button_registrar():
@@ -128,7 +128,11 @@ BUTTONS_PER_ROW = 2
 # 群里发这两个字就弹出开关面板
 MENU_WORD = "菜单"
 # 面板正文：一句英文，和中文按钮搭在一起有点仪表盘的感觉。
-MENU_HINT = "RECALL SETTINGS"
+# 只在插件设置页里能改（配置项 menu_title），菜单本身不提供改标题的按钮。
+DEFAULT_MENU_TITLE = "RECALL SETTINGS"
+MAX_MENU_TITLE_LEN = 40
+# 旧名字，留给外部脚本和测试引用；实际取值走 _menu_title()
+MENU_HINT = DEFAULT_MENU_TITLE
 # 官机没有纯按钮消息，正文总得给点什么；但不能给空串——空串会被平台收下、
 # 同时把 keyboard 丢掉，群里就只剩一个空白气泡。零宽空格是唯一安全的下限。
 EMPTY_TEXT = "\u200b"
@@ -292,6 +296,17 @@ class MessageRecall(Star):
             raw = DEFAULT_REPLIES[key]
         return str(raw).strip()[:MAX_REPLY_LEN]
 
+    def _menu_title(self) -> str:
+        """面板正文那行字：插件设置里的 menu_title，留空就回退默认值。
+
+        面板正文只有一行，所以换行、制表符和连续空格都压成单个空格；超长截断。
+        """
+        raw = self.config.get("menu_title", DEFAULT_MENU_TITLE)
+        if raw is None:
+            raw = DEFAULT_MENU_TITLE
+        title = " ".join(str(raw).split())
+        return title[:MAX_MENU_TITLE_LEN] or DEFAULT_MENU_TITLE
+
     def _keyword_pairs(self) -> list[tuple[str, str]]:
         """返回 (原词, 小写词)；配置没改时直接复用缓存，避免每条消息重解析+重 lower。"""
         raw = self._group("keyword").get("list", "")
@@ -403,10 +418,10 @@ class MessageRecall(Star):
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
         """发开关面板：6 个开关、一行两个，三行一条消息发完。
 
-        正文只有一句 RECALL SETTINGS，开关状态全在按钮 label 上。
+        正文就是配置里的菜单标题（默认 RECALL SETTINGS），开关状态全在按钮 label 上。
         """
         rows = self._keyboard_rows(SWITCH_KEYS, self._switch_on)
-        return await self._send_keyboard(event, MENU_HINT, rows)
+        return await self._send_keyboard(event, self._menu_title(), rows)
 
     def _claim_menu(self, event: AstrMessageEvent) -> bool:
         """同一条消息只弹一次面板。
