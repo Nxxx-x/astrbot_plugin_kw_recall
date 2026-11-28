@@ -45,7 +45,7 @@ QQ_OFFICIAL_TYPES = (
     | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
 )
 
-PLUGIN_VERSION = "1.11.4"
+PLUGIN_VERSION = "1.11.5"
 
 
 def _resolve_button_registrar():
@@ -131,7 +131,6 @@ MENU_WORD = "菜单"
 # 面板正文的一句说明：按钮上已经写着「撤回关键词 开」，正文只负责告诉人怎么用，
 # 所以一句话就够，既不空着（空着浪费一块白），也不复述按钮上的开关状态。
 MENU_HINT = "点击下方开关按钮"
-NOTIFY_HINT = "点击下方开关按钮，切换撤回提示"
 # 官机没有纯按钮消息，正文总得给点什么；但不能给空串——空串会被平台收下、
 # 同时把 keyboard 丢掉，群里就只剩一个空白气泡。零宽空格是唯一安全的下限。
 EMPTY_TEXT = "\u200b"
@@ -262,6 +261,8 @@ class MessageRecall(Star):
         # 词表解析结果缓存：配置对象每被保存一次，原始文本才变，届时自动重算
         self._kw_raw: Any = None
         self._kw_pairs: list[tuple[str, str]] = []
+        # 命令入口与文本入口可能命同一条消息，用 message_id 去重，别弹两套面板
+        self._menu_msg_id = ""
         logger.info(
             f"[kw_recall] v{PLUGIN_VERSION} 已加载，按钮入口："
             f"{'button_action' if BUTTON_REGISTRAR is not None else '普通监听（老版本兜底）'}"
@@ -404,18 +405,39 @@ class MessageRecall(Star):
     async def _send_menu(self, event: AstrMessageEvent) -> bool:
         """发开关面板。7 个开关、一条键盘最多 5 行，所以拆成两条消息。
 
-        正文各给一句说明，告诉人「点这里」；状态全在按钮的 label 上。两条消息
-        靠正文和按钮内容区分：第一条是五类规则，第二条是两个提示开关。
+        两条消息正文都是「点击下方开关按钮」，靠按钮内容区分：第一条是五类规则，
+        第二条是两个提示开关；开关状态全在按钮的 label 上。
         """
-        pages = (
-            (MENU_HINT, TYPE_KEYS),
-            (NOTIFY_HINT, ("notify", "notify_at")),
-        )
         sent = False
-        for hint, keys in pages:
+        for keys in (TYPE_KEYS, ("notify", "notify_at")):
             rows = self._keyboard_rows(keys, self._switch_on)
-            sent = await self._send_keyboard(event, hint, rows) or sent
+            sent = await self._send_keyboard(event, MENU_HINT, rows) or sent
         return sent
+
+    def _claim_menu(self, event: AstrMessageEvent) -> bool:
+        """同一条消息只弹一次面板。
+
+        「菜单」既是注册命令，又会在文本入口里被精确匹配，两条链路可能都走到；
+        用 message_id 认领一下，谁先到谁发，后到的直接放行。
+        """
+        mid = getattr(event.message_obj, "message_id", "") or ""
+        if not mid:
+            return True
+        if mid == self._menu_msg_id:
+            return False
+        self._menu_msg_id = mid
+        return True
+
+    async def _menu_response(self, event: AstrMessageEvent):
+        """发面板；发不出去（老版本/接口拒绝）时退成两行纯文本状态。"""
+        if not self._claim_menu(event):
+            return
+        if not await self._send_menu(event):
+            lines = (
+                self._switch_line(TYPE_KEYS),
+                self._switch_line(("notify", "notify_at")),
+            )
+            yield event.plain_result("\n".join(lines))
 
     def _toggle_flag(self, key: str) -> bool:
         """翻转一个开关并返回新状态；配置里缺字段时补出来。"""
@@ -834,6 +856,23 @@ class MessageRecall(Star):
                 yield event.plain_result(reply)
             event.stop_event()
 
+    @filter.command(MENU_WORD)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
+    async def cmd_menu(self, event: AstrMessageEvent):
+        """弹出撤回开关面板：五类规则 + 两个提示项，点按钮即切换"""
+        # 命令过滤只要开头对上就放行（后面跟字会被当参数），这里收紧成精确匹配，
+        # 让「菜单 你好」这类照旧不触发；唤醒前缀（/菜单、!菜单）先剥掉再比。
+        # 正文为空说明框架已把命令词吃掉，直接认下。
+        raw = (event.message_str or "").strip()
+        if raw:
+            words = raw.replace("/", " ").replace("!", " ").replace("！", " ").split()
+            if words != [MENU_WORD]:
+                return
+        async for result in self._menu_response(event):
+            yield result
+        event.stop_event()
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(QQ_OFFICIAL_TYPES)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -852,14 +891,11 @@ class MessageRecall(Star):
 
         # 1. 菜单：先于规则判断，免得「菜单」两个字被关键词规则顺手撤掉。
         # 谁能发都行，面板照发；点不点得动由按钮的 permission.type=1 决定。
+        # 裸发「菜单」走这里；带唤醒前缀的（如 /菜单）会先命中 cmd_menu 命令入口，
+        # 两边都认领同一条消息，靠 message_id 去重，不会弹两次。
         if text.strip() == MENU_WORD:
-            if not await self._send_menu(event):
-                # 发不出带按钮的消息（老版本/接口拒绝）时退成纯文本状态
-                lines = (
-                    self._switch_line(TYPE_KEYS),
-                    self._switch_line(("notify", "notify_at")),
-                )
-                yield event.plain_result("\n".join(lines))
+            async for result in self._menu_response(event):
+                yield result
             event.stop_event()
             return
 
